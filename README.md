@@ -30,3 +30,4 @@ sudo apt install -y \
   gstreamer1.0-libav \
   gstreamer1.0-gtk3# udp-video-viewer-mikrotik-sfp-monitor
 # udp-video-viewer-mikrotik-sfp-monitor
+# udp-video-viewer-mikrotik-sfp-monitor

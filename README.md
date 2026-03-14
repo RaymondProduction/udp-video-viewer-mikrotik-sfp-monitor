@@ -1,15 +1,16 @@
 # UDP Video Viewer + MikroTik SFP Monitor
 
-Python-програма для:
-- перегляду UDP відео (`raw` або `rtp`)
-- показу SFP telemetry з MikroTik поверх відео
-- роботи з MikroTik через SSH
+A Python application for:
 
-## Що потрібно
+- viewing UDP video (`raw` or `rtp`)
+- displaying SFP telemetry from MikroTik on top of the video
+- communicating with MikroTik via SSH
 
-### Системні пакети Ubuntu
+## Requirements
 
-Встановити системні залежності:
+### Ubuntu system packages
+
+Install the required system dependencies:
 
 ```bash
 sudo apt update
@@ -28,6 +29,4 @@ sudo apt install -y \
   gstreamer1.0-plugins-bad \
   gstreamer1.0-plugins-ugly \
   gstreamer1.0-libav \
-  gstreamer1.0-gtk3# udp-video-viewer-mikrotik-sfp-monitor
-# udp-video-viewer-mikrotik-sfp-monitor
-# udp-video-viewer-mikrotik-sfp-monitor
+  gstreamer1.0-gtk3

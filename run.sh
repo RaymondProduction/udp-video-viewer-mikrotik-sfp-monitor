@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -e
+
+cd "$(dirname "$0")"
+
+if [ ! -d "venv" ]; then
+  echo "Створюю venv..."
+  python3 -m venv venv --system-site-packages
+fi
+
+source venv/bin/activate
+
+#python -m pip install -r requirements.txt
+
+python main.py \
+  --port 5600 \
+  --mode rtp \
+  --always-on-top \
+  --mikrotik-host 192.168.121.1 \
+  --mikrotik-user admin \
+  --mikrotik-password "" \
+  --mikrotik-interface sfp1 \
+  --ssh-port 22

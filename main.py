@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import binascii
 import ipaddress
 import json
 import socket
@@ -11,6 +12,7 @@ from typing import Optional, List
 
 import gi
 import paramiko
+import serial
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gst", "1.0")
@@ -42,7 +44,6 @@ def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
 
                 network = ipaddress.ip_network(f"{local}/{prefixlen}", strict=False)
 
-                # Щоб не сканувати величезні мережі
                 if network.prefixlen < 24:
                     network = ipaddress.ip_network(f"{local}/24", strict=False)
 
@@ -221,6 +222,198 @@ def auto_discover_mikrotik(
     return None
 
 
+class UdpSerialBridge:
+    def __init__(
+        self,
+        remote_host: str,
+        remote_port: int,
+        serial_dev: str,
+        baudrate: int,
+        local_bind_ip: str = "0.0.0.0",
+        local_bind_port: int = 0,
+        serial_timeout: float = 0.01,
+        udp_timeout: float = 0.2,
+        verbose: bool = False,
+        hex_dump: bool = False,
+    ):
+        self.remote_host = remote_host
+        self.remote_port = remote_port
+        self.serial_dev = serial_dev
+        self.baudrate = baudrate
+        self.local_bind_ip = local_bind_ip
+        self.local_bind_port = local_bind_port
+        self.serial_timeout = serial_timeout
+        self.udp_timeout = udp_timeout
+        self.verbose = verbose
+        self.hex_dump = hex_dump
+
+        self.running = False
+        self.sock: Optional[socket.socket] = None
+        self.ser: Optional[serial.Serial] = None
+
+        self.bytes_udp_to_serial = 0
+        self.bytes_serial_to_udp = 0
+        self.packets_udp_to_serial = 0
+        self.packets_serial_to_udp = 0
+
+        self.actual_local_addr = "N/A"
+
+        self.t_udp_to_serial: Optional[threading.Thread] = None
+        self.t_serial_to_udp: Optional[threading.Thread] = None
+
+    def log(self, text: str):
+        if self.verbose:
+            print(f"[BRIDGE] {text}", flush=True)
+
+    def info(self, text: str):
+        print(f"[INFO] {text}", flush=True)
+
+    def err(self, text: str):
+        print(f"[ERROR] {text}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def short_hex(data: bytes, max_len: int = 64) -> str:
+        if not data:
+            return ""
+        part = data[:max_len]
+        txt = binascii.hexlify(part).decode("ascii")
+        if len(data) > max_len:
+            txt += "..."
+        return txt
+
+    def start(self):
+        self.stop()
+
+        self.info(
+            f"Opening serial: {self.serial_dev} @ {self.baudrate} (8N1, no flow control)"
+        )
+        self.ser = serial.Serial(
+            port=self.serial_dev,
+            baudrate=self.baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=self.serial_timeout,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
+        )
+
+        self.info(
+            f"Opening UDP: local {self.local_bind_ip}:{self.local_bind_port} -> "
+            f"remote {self.remote_host}:{self.remote_port}"
+        )
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((self.local_bind_ip, self.local_bind_port))
+        self.sock.connect((self.remote_host, self.remote_port))
+        self.sock.settimeout(self.udp_timeout)
+
+        local_ip, local_port = self.sock.getsockname()
+        self.actual_local_addr = f"{local_ip}:{local_port}"
+
+        self.running = True
+
+        self.t_udp_to_serial = threading.Thread(
+            target=self.udp_to_serial_loop,
+            daemon=True,
+            name="udp_to_serial",
+        )
+        self.t_serial_to_udp = threading.Thread(
+            target=self.serial_to_udp_loop,
+            daemon=True,
+            name="serial_to_udp",
+        )
+
+        self.t_udp_to_serial.start()
+        self.t_serial_to_udp.start()
+
+        self.info(
+            "Bridge started: "
+            f"local {self.actual_local_addr} <-> remote {self.remote_host}:{self.remote_port} "
+            f"<-> serial {self.serial_dev} @ {self.baudrate}"
+        )
+
+    def stop(self):
+        self.running = False
+
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+
+    def udp_to_serial_loop(self):
+        while self.running:
+            try:
+                if self.sock is None or self.ser is None:
+                    break
+
+                data = self.sock.recv(4096)
+                if not data:
+                    continue
+
+                self.ser.write(data)
+                self.packets_udp_to_serial += 1
+                self.bytes_udp_to_serial += len(data)
+
+                if self.hex_dump:
+                    self.log(
+                        f"UDP -> SERIAL | {len(data)} bytes | hex={self.short_hex(data)}"
+                    )
+                else:
+                    self.log(f"UDP -> SERIAL | {len(data)} bytes")
+
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as e:
+                self.err(f"udp_to_serial: {e}")
+                time.sleep(0.1)
+
+    def serial_to_udp_loop(self):
+        while self.running:
+            try:
+                if self.sock is None or self.ser is None:
+                    break
+
+                data = self.ser.read(4096)
+                if not data:
+                    continue
+
+                self.sock.send(data)
+                self.packets_serial_to_udp += 1
+                self.bytes_serial_to_udp += len(data)
+
+                if self.hex_dump:
+                    self.log(
+                        f"SERIAL -> UDP | {len(data)} bytes | hex={self.short_hex(data)}"
+                    )
+                else:
+                    self.log(f"SERIAL -> UDP | {len(data)} bytes")
+
+            except OSError:
+                break
+            except Exception as e:
+                self.err(f"serial_to_udp: {e}")
+                time.sleep(0.1)
+
+    def stats_text(self) -> str:
+        return (
+            f"local={self.actual_local_addr} remote={self.remote_host}:{self.remote_port} "
+            f"| U->S: {self.packets_udp_to_serial} pkt / {self.bytes_udp_to_serial} B "
+            f"| S->U: {self.packets_serial_to_udp} pkt / {self.bytes_serial_to_udp} B"
+        )
+
+
 class UdpVideoWindow:
     def __init__(
         self,
@@ -233,6 +426,14 @@ class UdpVideoWindow:
         mikrotik_interface: Optional[str],
         poll_interval: float,
         ssh_port: int,
+        serial_dev: Optional[str],
+        serial_baudrate: int,
+        bridge_remote_host: str,
+        bridge_remote_port: int,
+        bridge_local_bind_ip: str,
+        bridge_local_bind_port: int,
+        bridge_verbose: bool,
+        bridge_hex: bool,
     ):
         self.port = port
         self.mode = mode
@@ -242,6 +443,15 @@ class UdpVideoWindow:
         self.mikrotik_interface = mikrotik_interface
         self.poll_interval = max(0.5, poll_interval)
         self.ssh_port = ssh_port
+
+        self.serial_dev = serial_dev
+        self.serial_baudrate = serial_baudrate
+        self.bridge_remote_host = bridge_remote_host
+        self.bridge_remote_port = bridge_remote_port
+        self.bridge_local_bind_ip = bridge_local_bind_ip
+        self.bridge_local_bind_port = bridge_local_bind_port
+        self.bridge_verbose = bridge_verbose
+        self.bridge_hex = bridge_hex
 
         self.running = True
         self.manual_prefix = ""
@@ -299,12 +509,32 @@ class UdpVideoWindow:
         self.bus.add_signal_watch()
         self.bus.connect("message", self.on_bus_message)
 
+        self.bridge: Optional[UdpSerialBridge] = None
+        if self.serial_dev and self.bridge_remote_host:
+            try:
+                self.bridge = UdpSerialBridge(
+                    remote_host=self.bridge_remote_host,
+                    remote_port=self.bridge_remote_port,
+                    serial_dev=self.serial_dev,
+                    baudrate=self.serial_baudrate,
+                    local_bind_ip=self.bridge_local_bind_ip,
+                    local_bind_port=self.bridge_local_bind_port,
+                    verbose=self.bridge_verbose,
+                    hex_dump=self.bridge_hex,
+                )
+                self.bridge.start()
+            except Exception as e:
+                print(f"Не вдалося запустити bridge: {e}", file=sys.stderr)
+
         self.window.show_all()
         self.pipeline.set_state(Gst.State.PLAYING)
 
         self.mt_client: Optional[MikroTikSshClient] = None
         self.poll_thread = threading.Thread(target=self.poll_mikrotik_loop, daemon=True)
         self.poll_thread.start()
+
+        self.bridge_info_thread = threading.Thread(target=self.bridge_info_loop, daemon=True)
+        self.bridge_info_thread.start()
 
     def build_pipeline(self, port: int, mode: str, text: str) -> str:
         safe_text = self.escape_gst_text(text)
@@ -364,6 +594,19 @@ class UdpVideoWindow:
     def set_info_text(self, text: str):
         GLib.idle_add(self.info_label.set_text, text)
 
+    def build_info_text(self) -> str:
+        mt_host = self.mikrotik_host or "N/A"
+        mt_if = self.mikrotik_interface or "N/A"
+
+        lines = [
+            f"Video: {self.mode} UDP:{self.port} | MikroTik SSH: {mt_host}:{self.ssh_port} | IF: {mt_if} | Poll: {self.poll_interval:.1f}s"
+        ]
+
+        if self.bridge is not None:
+            lines.append(self.bridge.stats_text())
+
+        return "\n".join(lines)
+
     def build_overlay_text(
         self,
         rx_power: Optional[str],
@@ -417,6 +660,7 @@ class UdpVideoWindow:
                     "STATUS: MikroTik not found by SSH scan\n"
                     "Check IP connectivity or set --mikrotik-host"
                 )
+                self.set_info_text(self.build_info_text())
                 return False
             self.mikrotik_host = found
 
@@ -437,12 +681,11 @@ class UdpVideoWindow:
                 self.set_overlay_text(
                     f"HOST: {self.mikrotik_host}:{self.ssh_port}\nSTATUS: SFP interface not found"
                 )
+                self.set_info_text(self.build_info_text())
                 return False
             self.mikrotik_interface = found_if
 
-        self.set_info_text(
-            f"Video: {self.mode} UDP:{self.port} | MikroTik SSH: {self.mikrotik_host}:{self.ssh_port} | IF: {self.mikrotik_interface} | Poll: {self.poll_interval:.1f}s"
-        )
+        self.set_info_text(self.build_info_text())
         return True
 
     def poll_mikrotik_loop(self):
@@ -478,11 +721,20 @@ class UdpVideoWindow:
                     )
 
                 self.set_overlay_text(text)
+                self.set_info_text(self.build_info_text())
                 time.sleep(self.poll_interval)
 
         except Exception as e:
             self.set_overlay_text(f"STATUS: INIT ERROR: {type(e).__name__}")
             print(f"Init error: {e}", file=sys.stderr)
+
+    def bridge_info_loop(self):
+        while self.running:
+            try:
+                self.set_info_text(self.build_info_text())
+            except Exception:
+                pass
+            time.sleep(1.0)
 
     def on_bus_message(self, bus, message):
         msg_type = message.type
@@ -504,15 +756,20 @@ class UdpVideoWindow:
 
     def on_destroy(self, widget):
         self.running = False
+
+        if self.bridge is not None:
+            self.bridge.stop()
+
         if self.mt_client is not None:
             self.mt_client.disconnect()
+
         self.pipeline.set_state(Gst.State.NULL)
         Gtk.main_quit()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="UDP H.264 viewer with MikroTik SSH auto-discovery"
+        description="UDP H.264 viewer with MikroTik SSH auto-discovery and optional UDP<->Serial bridge"
     )
     parser.add_argument("--port", type=int, default=5600, help="UDP порт відео")
     parser.add_argument(
@@ -560,6 +817,50 @@ def main():
         help="Порт SSH MikroTik, зазвичай 22",
     )
 
+    parser.add_argument(
+        "--serial-dev",
+        default="",
+        help="Serial device для bridge, наприклад /dev/ttyACM0",
+    )
+    parser.add_argument(
+        "--serial-baudrate",
+        type=int,
+        default=420000,
+        help="Baudrate для bridge",
+    )
+    parser.add_argument(
+        "--bridge-remote-host",
+        default="",
+        help="Віддалена UDP IP-адреса для bridge, наприклад 192.168.121.50",
+    )
+    parser.add_argument(
+        "--bridge-remote-port",
+        type=int,
+        default=9000,
+        help="Віддалений UDP порт для bridge",
+    )
+    parser.add_argument(
+        "--bridge-local-bind-ip",
+        default="0.0.0.0",
+        help="Локальний bind IP для bridge",
+    )
+    parser.add_argument(
+        "--bridge-local-bind-port",
+        type=int,
+        default=0,
+        help="Локальний bind порт для bridge, 0 = автоматично",
+    )
+    parser.add_argument(
+        "--bridge-verbose",
+        action="store_true",
+        help="Показувати логи bridge",
+    )
+    parser.add_argument(
+        "--bridge-hex",
+        action="store_true",
+        help="Показувати hex у логах bridge",
+    )
+
     args = parser.parse_args()
 
     UdpVideoWindow(
@@ -572,6 +873,14 @@ def main():
         mikrotik_interface=args.mikrotik_interface or None,
         poll_interval=args.poll_interval,
         ssh_port=args.ssh_port,
+        serial_dev=args.serial_dev or None,
+        serial_baudrate=args.serial_baudrate,
+        bridge_remote_host=args.bridge_remote_host,
+        bridge_remote_port=args.bridge_remote_port,
+        bridge_local_bind_ip=args.bridge_local_bind_ip,
+        bridge_local_bind_port=args.bridge_local_bind_port,
+        bridge_verbose=args.bridge_verbose,
+        bridge_hex=args.bridge_hex,
     )
     Gtk.main()
 

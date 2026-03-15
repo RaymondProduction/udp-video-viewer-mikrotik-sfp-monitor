@@ -20,4 +20,11 @@ python main.py \
   --mikrotik-user admin \
   --mikrotik-password "" \
   --mikrotik-interface sfp1 \
-  --ssh-port 22
+  --serial-dev /dev/ttyACM0 \
+  --serial-baudrate 420000 \
+  --bridge-remote-host 192.168.121.50 \
+  --bridge-remote-port 9000 \
+  --bridge-hex \
+  --bridge-verbose
+
+#python test.py

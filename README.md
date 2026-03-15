@@ -5,6 +5,7 @@ A Python application for:
 - viewing UDP video (`raw` or `rtp`)
 - displaying SFP telemetry from MikroTik on top of the video
 - communicating with MikroTik via SSH
+- optionally running a UDP ↔ Serial bridge for controller/control link communication
 
 ## Requirements
 
@@ -21,6 +22,9 @@ sudo apt install -y \
   python3-gi \
   python3-gi-cairo \
   python3-gst-1.0 \
+  python3-serial \
+  python3-paramiko \
+  iproute2 \
   gir1.2-gtk-3.0 \
   gir1.2-gstreamer-1.0 \
   gstreamer1.0-tools \

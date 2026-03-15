@@ -13,6 +13,7 @@ from typing import Optional, List
 import gi
 import paramiko
 import serial
+from serial.tools import list_ports
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gst", "1.0")
@@ -69,6 +70,16 @@ def tcp_connectable(host: str, port: int, timeout: float = 0.5) -> bool:
             return True
     except Exception:
         return False
+
+
+def find_controller_serial_device() -> Optional[str]:
+    for p in list_ports.comports():
+        if (
+            p.manufacturer == "Raspberry Pi"
+            and p.product == "Pico"
+        ):
+            return p.device
+    return None
 
 
 class MikroTikSshClient:
@@ -350,6 +361,12 @@ class UdpSerialBridge:
                 pass
             self.ser = None
 
+    def is_alive(self) -> bool:
+        try:
+            return self.ser is not None and self.ser.is_open
+        except Exception:
+            return False
+
     def udp_to_serial_loop(self):
         while self.running:
             try:
@@ -457,6 +474,8 @@ class UdpVideoWindow:
         self.manual_prefix = ""
         self.identity_name = ""
 
+        self.auto_controller_enabled = not bool(self.serial_dev)
+
         self.window = Gtk.Window(title="UDP Video Viewer + MikroTik SFP Monitor")
         self.window.set_default_size(1100, 700)
         self.window.set_keep_above(always_on_top)
@@ -510,21 +529,9 @@ class UdpVideoWindow:
         self.bus.connect("message", self.on_bus_message)
 
         self.bridge: Optional[UdpSerialBridge] = None
-        if self.serial_dev and self.bridge_remote_host:
-            try:
-                self.bridge = UdpSerialBridge(
-                    remote_host=self.bridge_remote_host,
-                    remote_port=self.bridge_remote_port,
-                    serial_dev=self.serial_dev,
-                    baudrate=self.serial_baudrate,
-                    local_bind_ip=self.bridge_local_bind_ip,
-                    local_bind_port=self.bridge_local_bind_port,
-                    verbose=self.bridge_verbose,
-                    hex_dump=self.bridge_hex,
-                )
-                self.bridge.start()
-            except Exception as e:
-                print(f"Не вдалося запустити bridge: {e}", file=sys.stderr)
+
+        if self.bridge_remote_host:
+            self.ensure_bridge_running()
 
         self.window.show_all()
         self.pipeline.set_state(Gst.State.PLAYING)
@@ -535,6 +542,12 @@ class UdpVideoWindow:
 
         self.bridge_info_thread = threading.Thread(target=self.bridge_info_loop, daemon=True)
         self.bridge_info_thread.start()
+
+        self.controller_watch_thread = threading.Thread(
+            target=self.controller_watch_loop,
+            daemon=True,
+        )
+        self.controller_watch_thread.start()
 
     def build_pipeline(self, port: int, mode: str, text: str) -> str:
         safe_text = self.escape_gst_text(text)
@@ -604,8 +617,94 @@ class UdpVideoWindow:
 
         if self.bridge is not None:
             lines.append(self.bridge.stats_text())
+        elif self.bridge_remote_host:
+            if self.auto_controller_enabled:
+                lines.append("Controller bridge: waiting for Raspberry Pi Pico...")
+            else:
+                lines.append(f"Controller bridge: configured serial {self.serial_dev}, not running")
 
         return "\n".join(lines)
+
+    def ensure_bridge_running(self):
+        if not self.bridge_remote_host:
+            return
+
+        if self.bridge is not None and self.bridge.is_alive():
+            return
+
+        if self.bridge is not None:
+            try:
+                self.bridge.stop()
+            except Exception:
+                pass
+            self.bridge = None
+
+        serial_dev_to_use = self.serial_dev
+
+        if not serial_dev_to_use and self.auto_controller_enabled:
+            serial_dev_to_use = find_controller_serial_device()
+
+        if not serial_dev_to_use:
+            return
+
+        try:
+            self.bridge = UdpSerialBridge(
+                remote_host=self.bridge_remote_host,
+                remote_port=self.bridge_remote_port,
+                serial_dev=serial_dev_to_use,
+                baudrate=self.serial_baudrate,
+                local_bind_ip=self.bridge_local_bind_ip,
+                local_bind_port=self.bridge_local_bind_port,
+                verbose=self.bridge_verbose,
+                hex_dump=self.bridge_hex,
+            )
+            self.bridge.start()
+            self.serial_dev = serial_dev_to_use
+            print(f"[INFO] Controller connected: {serial_dev_to_use}", flush=True)
+        except Exception as e:
+            print(f"[WARN] Bridge start failed for {serial_dev_to_use}: {e}", file=sys.stderr)
+            self.bridge = None
+            if self.auto_controller_enabled:
+                self.serial_dev = None
+
+    def controller_watch_loop(self):
+        last_seen = None
+
+        while self.running:
+            try:
+                found = find_controller_serial_device() if self.auto_controller_enabled else self.serial_dev
+
+                if found != last_seen:
+                    if found:
+                        print(f"[INFO] Controller detected: {found}", flush=True)
+                    else:
+                        print("[INFO] Controller disconnected", flush=True)
+                    last_seen = found
+
+                if self.auto_controller_enabled:
+                    if found:
+                        if self.bridge is None:
+                            self.serial_dev = found
+                            self.ensure_bridge_running()
+                    else:
+                        if self.bridge is not None:
+                            print("[INFO] Stopping bridge because controller disappeared", flush=True)
+                            try:
+                                self.bridge.stop()
+                            except Exception:
+                                pass
+                            self.bridge = None
+                            self.serial_dev = None
+                else:
+                    if self.bridge is None and self.serial_dev:
+                        self.ensure_bridge_running()
+
+                self.set_info_text(self.build_info_text())
+
+            except Exception as e:
+                print(f"[WARN] controller_watch_loop: {e}", file=sys.stderr)
+
+            time.sleep(1.0)
 
     def build_overlay_text(
         self,
@@ -820,7 +919,7 @@ def main():
     parser.add_argument(
         "--serial-dev",
         default="",
-        help="Serial device для bridge, наприклад /dev/ttyACM0",
+        help="Serial device для bridge, наприклад /dev/ttyACM0. Якщо не вказано — буде автопошук Pico",
     )
     parser.add_argument(
         "--serial-baudrate",

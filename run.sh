@@ -12,7 +12,7 @@ source venv/bin/activate
 
 #python -m pip install -r requirements.txt
 
-python main.py \
+  python main.py \
   --port 5600 \
   --mode rtp \
   --always-on-top \

@@ -607,11 +607,11 @@ class UdpVideoWindow:
 
         self.auto_controller_enabled = not bool(self.serial_dev)
 
-        self.load_osd_settings()
+        self.load_settings()
 
         self.window = Gtk.Window(title="UDP Video Viewer + MikroTik SFP Monitor")
         self.window.set_default_size(1100, 700)
-        self.window.set_keep_above(always_on_top)
+        self.window.set_keep_above(self.always_on_top)
         self.window.connect("destroy", self.on_destroy)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -634,9 +634,9 @@ class UdpVideoWindow:
         btn_clear.connect("clicked", self.clear_prefix)
         top_bar.pack_start(btn_clear, False, False, 0)
 
-        btn_osd = Gtk.Button(label="OSD...")
-        btn_osd.connect("clicked", self.open_osd_settings)
-        top_bar.pack_start(btn_osd, False, False, 0)
+        btn_settings = Gtk.Button(label="Налаштування...")
+        btn_settings.connect("clicked", self.open_ground_station_settings)
+        top_bar.pack_start(btn_settings, False, False, 0)
 
         self.info_label = Gtk.Label(label="Video init...")
         self.info_label.set_xalign(0.0)
@@ -645,25 +645,12 @@ class UdpVideoWindow:
         self.video_box = Gtk.Box()
         root.pack_start(self.video_box, True, True, 0)
 
-        pipeline_str = self.build_pipeline(port, mode, "Connecting to MikroTik SSH...")
-        print("Pipeline:")
-        print(pipeline_str)
+        self.pipeline = None
+        self.overlay = None
+        self.video_sink = None
+        self.bus = None
 
-        self.pipeline = Gst.parse_launch(pipeline_str)
-        self.overlay = self.pipeline.get_by_name("overlay")
-        self.video_sink = self.pipeline.get_by_name("videosink")
-
-        if self.overlay is None:
-            raise RuntimeError("Не вдалося знайти textoverlay")
-        if self.video_sink is None:
-            raise RuntimeError("Не вдалося знайти gtksink")
-
-        video_widget = self.video_sink.props.widget
-        self.video_box.pack_start(video_widget, True, True, 0)
-
-        self.bus = self.pipeline.get_bus()
-        self.bus.add_signal_watch()
-        self.bus.connect("message", self.on_bus_message)
+        self.build_and_start_pipeline("Connecting to MikroTik SSH...")
 
         self.bridge: Optional[UdpSerialBridge] = None
 
@@ -671,7 +658,6 @@ class UdpVideoWindow:
             self.ensure_bridge_running()
 
         self.window.show_all()
-        self.pipeline.set_state(Gst.State.PLAYING)
 
         self.mt_client: Optional[MikroTikSshClient] = None
         self.poll_thread = threading.Thread(target=self.poll_mikrotik_loop, daemon=True)
@@ -686,7 +672,7 @@ class UdpVideoWindow:
         )
         self.controller_watch_thread.start()
 
-    def set_default_osd_settings(self):
+    def set_default_settings(self):
         self.overlay_xpad = 0
         self.overlay_ypad = 400
         self.overlay_font_size = 8
@@ -694,51 +680,125 @@ class UdpVideoWindow:
         self.overlay_halign = "right"
         self.overlay_valign = "top"
 
-    def load_osd_settings(self):
-        self.set_default_osd_settings()
+        self.show_loss = True
+        self.show_distance = True
+        self.show_wavelength = True
+
+        self.port = 5600
+        self.mode = "rtp"
+        self.always_on_top = True
+
+        self.mikrotik_host = "192.168.121.1"
+        self.mikrotik_user = "admin"
+        self.mikrotik_password = ""
+        self.mikrotik_interface = "sfp1"
+
+        self.serial_dev = None
+        self.serial_baudrate = 420000
+        self.bridge_remote_host = "192.168.121.50"
+        self.bridge_remote_port = 9000
+        self.bridge_local_bind_ip = "0.0.0.0"
+        self.bridge_local_bind_port = 0
+        self.bridge_verbose = False
+        self.bridge_hex = True
+
+    def load_settings(self):
+        self.set_default_settings()
 
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            self.overlay_xpad = int(data.get("xpad", self.overlay_xpad))
-            self.overlay_ypad = int(data.get("ypad", self.overlay_ypad))
-            self.overlay_font_size = int(data.get("font_size", self.overlay_font_size))
-            self.overlay_background = bool(data.get("background", self.overlay_background))
+            osd = data.get("osd", {})
+            self.overlay_xpad = int(osd.get("xpad", self.overlay_xpad))
+            self.overlay_ypad = int(osd.get("ypad", self.overlay_ypad))
+            self.overlay_font_size = int(osd.get("font_size", self.overlay_font_size))
+            self.overlay_background = bool(osd.get("background", self.overlay_background))
 
-            halign = str(data.get("halign", self.overlay_halign)).lower()
+            halign = str(osd.get("halign", self.overlay_halign)).lower()
             if halign in ("left", "right"):
                 self.overlay_halign = halign
 
-            valign = str(data.get("valign", self.overlay_valign)).lower()
+            valign = str(osd.get("valign", self.overlay_valign)).lower()
             if valign in ("top", "bottom"):
                 self.overlay_valign = valign
 
-            print(f"[INFO] OSD settings loaded from {SETTINGS_FILE}", flush=True)
+            self.show_loss = bool(osd.get("show_loss", self.show_loss))
+            self.show_distance = bool(osd.get("show_distance", self.show_distance))
+            self.show_wavelength = bool(osd.get("show_wavelength", self.show_wavelength))
+
+            bridge = data.get("bridge", {})
+            self.serial_dev = bridge.get("serial_dev") or None
+            self.serial_baudrate = int(bridge.get("serial_baudrate", self.serial_baudrate))
+            self.bridge_remote_host = str(bridge.get("remote_host", self.bridge_remote_host))
+            self.bridge_remote_port = int(bridge.get("remote_port", self.bridge_remote_port))
+            self.bridge_local_bind_ip = str(bridge.get("local_bind_ip", self.bridge_local_bind_ip))
+            self.bridge_local_bind_port = int(bridge.get("local_bind_port", self.bridge_local_bind_port))
+            self.bridge_verbose = bool(bridge.get("verbose", self.bridge_verbose))
+            self.bridge_hex = bool(bridge.get("hex", self.bridge_hex))
+
+            video = data.get("video", {})
+            self.port = int(video.get("port", self.port))
+            mode = str(video.get("mode", self.mode)).lower()
+            if mode in ("raw", "rtp"):
+                self.mode = mode
+            self.always_on_top = bool(video.get("always_on_top", self.always_on_top))
+
+            mikrotik = data.get("mikrotik", {})
+            self.mikrotik_host = str(mikrotik.get("host", self.mikrotik_host))
+            self.mikrotik_user = str(mikrotik.get("user", self.mikrotik_user))
+            self.mikrotik_password = str(mikrotik.get("password", self.mikrotik_password))
+            self.mikrotik_interface = str(mikrotik.get("interface", self.mikrotik_interface))
+
+            print(f"[INFO] Ground station settings loaded from {SETTINGS_FILE}", flush=True)
 
         except FileNotFoundError:
-            print("[INFO] OSD settings file not found, using defaults", flush=True)
+            print("[INFO] Settings file not found, using defaults", flush=True)
         except Exception as e:
-            print(f"[WARN] Failed to load OSD settings: {e}", file=sys.stderr)
+            print(f"[WARN] Failed to load settings: {e}", file=sys.stderr)
 
-    def save_osd_settings(self):
+    def save_settings(self):
         data = {
-            "xpad": self.overlay_xpad,
-            "ypad": self.overlay_ypad,
-            "font_size": self.overlay_font_size,
-            "background": self.overlay_background,
-            "halign": self.overlay_halign,
-            "valign": self.overlay_valign,
+            "osd": {
+                "xpad": self.overlay_xpad,
+                "ypad": self.overlay_ypad,
+                "font_size": self.overlay_font_size,
+                "background": self.overlay_background,
+                "halign": self.overlay_halign,
+                "valign": self.overlay_valign,
+                "show_loss": self.show_loss,
+                "show_distance": self.show_distance,
+                "show_wavelength": self.show_wavelength,
+            },
+            "bridge": {
+                "serial_dev": self.serial_dev or "",
+                "serial_baudrate": self.serial_baudrate,
+                "remote_host": self.bridge_remote_host,
+                "remote_port": self.bridge_remote_port,
+                "local_bind_ip": self.bridge_local_bind_ip,
+                "local_bind_port": self.bridge_local_bind_port,
+                "verbose": self.bridge_verbose,
+                "hex": self.bridge_hex,
+            },
+            "video": {
+                "port": self.port,
+                "mode": self.mode,
+                "always_on_top": self.always_on_top,
+            },
+            "mikrotik": {
+                "host": self.mikrotik_host,
+                "user": self.mikrotik_user,
+                "password": self.mikrotik_password,
+                "interface": self.mikrotik_interface,
+            },
         }
 
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-
-            print(f"[INFO] OSD settings saved to {SETTINGS_FILE}", flush=True)
-
+            print(f"[INFO] Ground station settings saved to {SETTINGS_FILE}", flush=True)
         except Exception as e:
-            print(f"[ERROR] Failed to save OSD settings: {e}", file=sys.stderr)
+            print(f"[ERROR] Failed to save settings: {e}", file=sys.stderr)
 
     def build_pipeline(self, port: int, mode: str, text: str) -> str:
         safe_text = self.escape_gst_text(text)
@@ -785,6 +845,29 @@ class UdpVideoWindow:
             """
 
         raise ValueError("Невідомий режим. Використовуйте raw або rtp.")
+
+    def build_and_start_pipeline(self, text: str):
+        pipeline_str = self.build_pipeline(self.port, self.mode, text)
+        print("Pipeline:")
+        print(pipeline_str)
+
+        self.pipeline = Gst.parse_launch(pipeline_str)
+        self.overlay = self.pipeline.get_by_name("overlay")
+        self.video_sink = self.pipeline.get_by_name("videosink")
+
+        if self.overlay is None:
+            raise RuntimeError("Не вдалося знайти textoverlay")
+        if self.video_sink is None:
+            raise RuntimeError("Не вдалося знайти gtksink")
+
+        video_widget = self.video_sink.props.widget
+        self.video_box.pack_start(video_widget, True, True, 0)
+
+        self.bus = self.pipeline.get_bus()
+        self.bus.add_signal_watch()
+        self.bus.connect("message", self.on_bus_message)
+
+        self.pipeline.set_state(Gst.State.PLAYING)
 
     @staticmethod
     def escape_gst_text(text: str) -> str:
@@ -849,6 +932,14 @@ class UdpVideoWindow:
         except Exception:
             pass
 
+        self.pipeline = None
+        self.overlay = None
+        self.video_sink = None
+        self.bus = None
+
+        for child in self.video_box.get_children():
+            self.video_box.remove(child)
+
         pipeline_str = self.build_pipeline(
             self.port,
             self.mode,
@@ -867,10 +958,6 @@ class UdpVideoWindow:
             raise RuntimeError("Не вдалося знайти gtksink")
 
         video_widget = self.video_sink.props.widget
-
-        for child in self.video_box.get_children():
-            self.video_box.remove(child)
-
         self.video_box.pack_start(video_widget, True, True, 0)
         self.video_box.show_all()
 
@@ -880,84 +967,256 @@ class UdpVideoWindow:
 
         self.pipeline.set_state(Gst.State.PLAYING)
 
-    def open_osd_settings(self, widget):
+    def restart_bridge(self):
+        if self.bridge is not None:
+            try:
+                self.bridge.stop()
+            except Exception:
+                pass
+            self.bridge = None
+
+        if self.bridge_remote_host:
+            self.ensure_bridge_running()
+
+    def open_ground_station_settings(self, widget):
         dialog = Gtk.Dialog(
             title="Налаштування наземної станції",
             transient_for=self.window,
             flags=0,
         )
+        dialog.set_default_size(720, 620)
         dialog.add_button("Reset", 1)
         dialog.add_button("Скасувати", Gtk.ResponseType.CANCEL)
         dialog.add_button("Застосувати", Gtk.ResponseType.OK)
 
         content = dialog.get_content_area()
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
         content.add(box)
 
-        grid = Gtk.Grid(column_spacing=10, row_spacing=10)
-        box.pack_start(grid, True, True, 0)
+        notebook = Gtk.Notebook()
+        box.pack_start(notebook, True, True, 0)
+
+        # OSD
+        osd_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        osd_grid = Gtk.Grid(column_spacing=10, row_spacing=10)
+        osd_box.pack_start(osd_grid, False, False, 0)
 
         row = 0
 
         lbl_x = Gtk.Label(label="X:")
         lbl_x.set_xalign(0.0)
-        grid.attach(lbl_x, 0, row, 1, 1)
-
+        osd_grid.attach(lbl_x, 0, row, 1, 1)
         spin_x = Gtk.SpinButton()
         spin_x.set_range(0, 5000)
         spin_x.set_increments(1, 10)
         spin_x.set_value(self.overlay_xpad)
-        grid.attach(spin_x, 1, row, 1, 1)
+        osd_grid.attach(spin_x, 1, row, 1, 1)
         row += 1
 
         lbl_y = Gtk.Label(label="Y:")
         lbl_y.set_xalign(0.0)
-        grid.attach(lbl_y, 0, row, 1, 1)
-
+        osd_grid.attach(lbl_y, 0, row, 1, 1)
         spin_y = Gtk.SpinButton()
         spin_y.set_range(0, 5000)
         spin_y.set_increments(1, 10)
         spin_y.set_value(self.overlay_ypad)
-        grid.attach(spin_y, 1, row, 1, 1)
+        osd_grid.attach(spin_y, 1, row, 1, 1)
         row += 1
 
         lbl_font = Gtk.Label(label="Font size:")
         lbl_font.set_xalign(0.0)
-        grid.attach(lbl_font, 0, row, 1, 1)
-
+        osd_grid.attach(lbl_font, 0, row, 1, 1)
         spin_font = Gtk.SpinButton()
         spin_font.set_range(6, 72)
         spin_font.set_increments(1, 2)
         spin_font.set_value(self.overlay_font_size)
-        grid.attach(spin_font, 1, row, 1, 1)
+        osd_grid.attach(spin_font, 1, row, 1, 1)
         row += 1
 
         chk_bg = Gtk.CheckButton(label="Background")
         chk_bg.set_active(self.overlay_background)
-        grid.attach(chk_bg, 0, row, 2, 1)
+        osd_grid.attach(chk_bg, 0, row, 2, 1)
         row += 1
 
         lbl_halign = Gtk.Label(label="Horizontal:")
         lbl_halign.set_xalign(0.0)
-        grid.attach(lbl_halign, 0, row, 1, 1)
-
+        osd_grid.attach(lbl_halign, 0, row, 1, 1)
         combo_halign = Gtk.ComboBoxText()
         combo_halign.append("left", "Left")
         combo_halign.append("right", "Right")
         combo_halign.set_active_id(self.overlay_halign)
-        grid.attach(combo_halign, 1, row, 1, 1)
+        osd_grid.attach(combo_halign, 1, row, 1, 1)
         row += 1
 
         lbl_valign = Gtk.Label(label="Vertical:")
         lbl_valign.set_xalign(0.0)
-        grid.attach(lbl_valign, 0, row, 1, 1)
-
+        osd_grid.attach(lbl_valign, 0, row, 1, 1)
         combo_valign = Gtk.ComboBoxText()
         combo_valign.append("top", "Top")
         combo_valign.append("bottom", "Bottom")
         combo_valign.set_active_id(self.overlay_valign)
-        grid.attach(combo_valign, 1, row, 1, 1)
+        osd_grid.attach(combo_valign, 1, row, 1, 1)
+        row += 1
+
+        chk_show_loss = Gtk.CheckButton(label="Показувати затухання")
+        chk_show_loss.set_active(self.show_loss)
+        osd_grid.attach(chk_show_loss, 0, row, 2, 1)
+        row += 1
+
+        chk_show_distance = Gtk.CheckButton(label="Показувати дистанцію")
+        chk_show_distance.set_active(self.show_distance)
+        osd_grid.attach(chk_show_distance, 0, row, 2, 1)
+        row += 1
+
+        chk_show_wavelength = Gtk.CheckButton(label="Показувати довжину хвилі SFP")
+        chk_show_wavelength.set_active(self.show_wavelength)
+        osd_grid.attach(chk_show_wavelength, 0, row, 2, 1)
+
+        notebook.append_page(osd_box, Gtk.Label(label="OSD"))
+
+        # Bridge
+        bridge_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        bridge_grid = Gtk.Grid(column_spacing=10, row_spacing=10)
+        bridge_box.pack_start(bridge_grid, False, False, 0)
+
+        row = 0
+
+        lbl_serial_dev = Gtk.Label(label="Serial device:")
+        lbl_serial_dev.set_xalign(0.0)
+        bridge_grid.attach(lbl_serial_dev, 0, row, 1, 1)
+        entry_serial_dev = Gtk.Entry()
+        entry_serial_dev.set_text(self.serial_dev or "")
+        bridge_grid.attach(entry_serial_dev, 1, row, 1, 1)
+        row += 1
+
+        lbl_serial_baud = Gtk.Label(label="Baudrate:")
+        lbl_serial_baud.set_xalign(0.0)
+        bridge_grid.attach(lbl_serial_baud, 0, row, 1, 1)
+        spin_serial_baud = Gtk.SpinButton()
+        spin_serial_baud.set_range(1200, 5000000)
+        spin_serial_baud.set_increments(100, 1000)
+        spin_serial_baud.set_value(self.serial_baudrate)
+        bridge_grid.attach(spin_serial_baud, 1, row, 1, 1)
+        row += 1
+
+        lbl_remote_host = Gtk.Label(label="Remote host:")
+        lbl_remote_host.set_xalign(0.0)
+        bridge_grid.attach(lbl_remote_host, 0, row, 1, 1)
+        entry_remote_host = Gtk.Entry()
+        entry_remote_host.set_text(self.bridge_remote_host)
+        bridge_grid.attach(entry_remote_host, 1, row, 1, 1)
+        row += 1
+
+        lbl_remote_port = Gtk.Label(label="Remote port:")
+        lbl_remote_port.set_xalign(0.0)
+        bridge_grid.attach(lbl_remote_port, 0, row, 1, 1)
+        spin_remote_port = Gtk.SpinButton()
+        spin_remote_port.set_range(0, 65535)
+        spin_remote_port.set_value(self.bridge_remote_port)
+        bridge_grid.attach(spin_remote_port, 1, row, 1, 1)
+        row += 1
+
+        lbl_local_bind_ip = Gtk.Label(label="Local bind IP:")
+        lbl_local_bind_ip.set_xalign(0.0)
+        bridge_grid.attach(lbl_local_bind_ip, 0, row, 1, 1)
+        entry_local_bind_ip = Gtk.Entry()
+        entry_local_bind_ip.set_text(self.bridge_local_bind_ip)
+        bridge_grid.attach(entry_local_bind_ip, 1, row, 1, 1)
+        row += 1
+
+        lbl_local_bind_port = Gtk.Label(label="Local bind port:")
+        lbl_local_bind_port.set_xalign(0.0)
+        bridge_grid.attach(lbl_local_bind_port, 0, row, 1, 1)
+        spin_local_bind_port = Gtk.SpinButton()
+        spin_local_bind_port.set_range(0, 65535)
+        spin_local_bind_port.set_value(self.bridge_local_bind_port)
+        bridge_grid.attach(spin_local_bind_port, 1, row, 1, 1)
+        row += 1
+
+        chk_bridge_verbose = Gtk.CheckButton(label="Показувати логи bridge")
+        chk_bridge_verbose.set_active(self.bridge_verbose)
+        bridge_grid.attach(chk_bridge_verbose, 0, row, 2, 1)
+        row += 1
+
+        chk_bridge_hex = Gtk.CheckButton(label="Показувати hex у логах bridge")
+        chk_bridge_hex.set_active(self.bridge_hex)
+        bridge_grid.attach(chk_bridge_hex, 0, row, 2, 1)
+
+        notebook.append_page(bridge_box, Gtk.Label(label="Міст керування"))
+
+        # Video
+        video_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        video_grid = Gtk.Grid(column_spacing=10, row_spacing=10)
+        video_box.pack_start(video_grid, False, False, 0)
+
+        row = 0
+
+        lbl_video_port = Gtk.Label(label="UDP port:")
+        lbl_video_port.set_xalign(0.0)
+        video_grid.attach(lbl_video_port, 0, row, 1, 1)
+        spin_video_port = Gtk.SpinButton()
+        spin_video_port.set_range(1, 65535)
+        spin_video_port.set_value(self.port)
+        video_grid.attach(spin_video_port, 1, row, 1, 1)
+        row += 1
+
+        lbl_video_mode = Gtk.Label(label="Mode:")
+        lbl_video_mode.set_xalign(0.0)
+        video_grid.attach(lbl_video_mode, 0, row, 1, 1)
+        combo_video_mode = Gtk.ComboBoxText()
+        combo_video_mode.append("raw", "raw")
+        combo_video_mode.append("rtp", "rtp")
+        combo_video_mode.set_active_id(self.mode)
+        video_grid.attach(combo_video_mode, 1, row, 1, 1)
+        row += 1
+
+        chk_always_on_top = Gtk.CheckButton(label="always-on-top")
+        chk_always_on_top.set_active(self.always_on_top)
+        video_grid.attach(chk_always_on_top, 0, row, 2, 1)
+
+        notebook.append_page(video_box, Gtk.Label(label="Відеопотік"))
+
+        # MikroTik
+        mt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        mt_grid = Gtk.Grid(column_spacing=10, row_spacing=10)
+        mt_box.pack_start(mt_grid, False, False, 0)
+
+        row = 0
+
+        lbl_mt_host = Gtk.Label(label="MikroTik host:")
+        lbl_mt_host.set_xalign(0.0)
+        mt_grid.attach(lbl_mt_host, 0, row, 1, 1)
+        entry_mt_host = Gtk.Entry()
+        entry_mt_host.set_text(self.mikrotik_host or "")
+        mt_grid.attach(entry_mt_host, 1, row, 1, 1)
+        row += 1
+
+        lbl_mt_user = Gtk.Label(label="MikroTik user:")
+        lbl_mt_user.set_xalign(0.0)
+        mt_grid.attach(lbl_mt_user, 0, row, 1, 1)
+        entry_mt_user = Gtk.Entry()
+        entry_mt_user.set_text(self.mikrotik_user)
+        mt_grid.attach(entry_mt_user, 1, row, 1, 1)
+        row += 1
+
+        lbl_mt_password = Gtk.Label(label="MikroTik password:")
+        lbl_mt_password.set_xalign(0.0)
+        mt_grid.attach(lbl_mt_password, 0, row, 1, 1)
+        entry_mt_password = Gtk.Entry()
+        entry_mt_password.set_visibility(False)
+        entry_mt_password.set_text(self.mikrotik_password)
+        mt_grid.attach(entry_mt_password, 1, row, 1, 1)
+        row += 1
+
+        lbl_mt_if = Gtk.Label(label="SFP interface:")
+        lbl_mt_if.set_xalign(0.0)
+        mt_grid.attach(lbl_mt_if, 0, row, 1, 1)
+        entry_mt_if = Gtk.Entry()
+        entry_mt_if.set_text(self.mikrotik_interface or "")
+        mt_grid.attach(entry_mt_if, 1, row, 1, 1)
+
+        notebook.append_page(mt_box, Gtk.Label(label="MikroTik / SFP"))
 
         def apply_defaults_to_widgets():
             spin_x.set_value(0)
@@ -966,6 +1225,27 @@ class UdpVideoWindow:
             chk_bg.set_active(False)
             combo_halign.set_active_id("right")
             combo_valign.set_active_id("top")
+            chk_show_loss.set_active(True)
+            chk_show_distance.set_active(True)
+            chk_show_wavelength.set_active(True)
+
+            entry_serial_dev.set_text("")
+            spin_serial_baud.set_value(420000)
+            entry_remote_host.set_text("192.168.121.50")
+            spin_remote_port.set_value(9000)
+            entry_local_bind_ip.set_text("0.0.0.0")
+            spin_local_bind_port.set_value(0)
+            chk_bridge_verbose.set_active(False)
+            chk_bridge_hex.set_active(True)
+
+            spin_video_port.set_value(5600)
+            combo_video_mode.set_active_id("rtp")
+            chk_always_on_top.set_active(True)
+
+            entry_mt_host.set_text("192.168.121.1")
+            entry_mt_user.set_text("admin")
+            entry_mt_password.set_text("")
+            entry_mt_if.set_text("sfp1")
 
         dialog.show_all()
 
@@ -977,15 +1257,43 @@ class UdpVideoWindow:
                 continue
 
             if response == Gtk.ResponseType.OK:
+                # OSD
                 self.overlay_xpad = spin_x.get_value_as_int()
                 self.overlay_ypad = spin_y.get_value_as_int()
                 self.overlay_font_size = spin_font.get_value_as_int()
                 self.overlay_background = chk_bg.get_active()
                 self.overlay_halign = combo_halign.get_active_id() or "right"
                 self.overlay_valign = combo_valign.get_active_id() or "top"
+                self.show_loss = chk_show_loss.get_active()
+                self.show_distance = chk_show_distance.get_active()
+                self.show_wavelength = chk_show_wavelength.get_active()
 
-                self.save_osd_settings()
+                # Bridge
+                serial_dev_text = entry_serial_dev.get_text().strip()
+                self.serial_dev = serial_dev_text if serial_dev_text else None
+                self.serial_baudrate = spin_serial_baud.get_value_as_int()
+                self.bridge_remote_host = entry_remote_host.get_text().strip()
+                self.bridge_remote_port = spin_remote_port.get_value_as_int()
+                self.bridge_local_bind_ip = entry_local_bind_ip.get_text().strip() or "0.0.0.0"
+                self.bridge_local_bind_port = spin_local_bind_port.get_value_as_int()
+                self.bridge_verbose = chk_bridge_verbose.get_active()
+                self.bridge_hex = chk_bridge_hex.get_active()
+
+                # Video
+                self.port = spin_video_port.get_value_as_int()
+                self.mode = combo_video_mode.get_active_id() or "rtp"
+                self.always_on_top = chk_always_on_top.get_active()
+
+                # MikroTik
+                self.mikrotik_host = entry_mt_host.get_text().strip()
+                self.mikrotik_user = entry_mt_user.get_text().strip() or "admin"
+                self.mikrotik_password = entry_mt_password.get_text()
+                self.mikrotik_interface = entry_mt_if.get_text().strip()
+
+                self.save_settings()
+                self.window.set_keep_above(self.always_on_top)
                 self.restart_video_pipeline()
+                self.restart_bridge()
 
             break
 
@@ -1103,16 +1411,16 @@ class UdpVideoWindow:
         rx_val = parse_dbm_value(rx_power)
         tx_val = parse_dbm_value(tx_power)
 
-        loss_text = "N/A"
-        if tx_val is not None and rx_val is not None:
-            loss_text = f"{(tx_val - rx_val):.2f} dB"
-
-        lines.append(f"LOSS: {loss_text}")
+        if self.show_loss:
+            loss_text = "N/A"
+            if tx_val is not None and rx_val is not None:
+                loss_text = f"{(tx_val - rx_val):.2f} dB"
+            lines.append(f"LOSS: {loss_text}")
 
         wl_dist = []
-        if wavelength:
+        if self.show_wavelength and wavelength:
             wl_dist.append(f"WL: {wavelength}")
-        if distance:
+        if self.show_distance and distance:
             wl_dist.append(f"DIST: {distance}")
 
         if wl_dist:
@@ -1249,7 +1557,9 @@ class UdpVideoWindow:
         if self.mt_client is not None:
             self.mt_client.disconnect()
 
-        self.pipeline.set_state(Gst.State.NULL)
+        if self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+
         Gtk.main_quit()
 
 
@@ -1272,7 +1582,7 @@ def main():
 
     parser.add_argument(
         "--mikrotik-host",
-        default="",
+        default="192.168.121.1",
         help="IP MikroTik. Можна не вказувати — буде автопошук по SSH",
     )
     parser.add_argument(
@@ -1287,7 +1597,7 @@ def main():
     )
     parser.add_argument(
         "--mikrotik-interface",
-        default="",
+        default="sfp1",
         help="Можна не вказувати — буде автопошук SFP інтерфейсу",
     )
     parser.add_argument(
@@ -1316,7 +1626,7 @@ def main():
     )
     parser.add_argument(
         "--bridge-remote-host",
-        default="",
+        default="192.168.121.50",
         help="Віддалена UDP IP-адреса для bridge, наприклад 192.168.121.50",
     )
     parser.add_argument(

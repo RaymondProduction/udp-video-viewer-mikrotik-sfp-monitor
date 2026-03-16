@@ -150,13 +150,18 @@ def infer_distance_from_text(text: str) -> Optional[str]:
     if not text:
         return None
 
+    # Явний формат: 20km / 20 km
     match = re.search(r"\b(\d+(?:\.\d+)?)\s*km\b", text, re.IGNORECASE)
     if match:
         return f"{match.group(1)}km"
 
-    # інколи в part number є просто 20 / 40 / 80 / 120 як дальність
-    # але не хочемо ловити будь-які числа, тому обмежимо типовими значеннями
-    match = re.search(r"\b(1|2|3|5|10|20|40|60|80|100|120)\b", text)
+    # Формат типу 20KM у part number
+    match = re.search(r"(?<!\d)(1|2|3|5|10|20|40|60|80|100|120)\s*km(?!\w)", text, re.IGNORECASE)
+    if match:
+        return f"{match.group(1)}km"
+
+    # Витягуємо типові дальності навіть якщо вони йдуть біля інших символів
+    match = re.search(r"(?:^|[-_/ ])(1|2|3|5|10|20|40|60|80|100|120)(?:[-_/ ]|$)", text)
     if match:
         return f"{match.group(1)}km"
 
@@ -282,7 +287,7 @@ class MikroTikSshClient:
                 voltage = line.split(":", 1)[1].strip()
             elif "sfp-wavelength:" in lower:
                 wavelength = line.split(":", 1)[1].strip()
-            elif "sfp-link-length:" in lower:
+            elif "sfp-link-length-sm:" in lower:
                 distance = line.split(":", 1)[1].strip()
             elif "sfp-length:" in lower:
                 distance = line.split(":", 1)[1].strip()
@@ -850,14 +855,14 @@ class UdpVideoWindow:
         if self.manual_prefix:
             lines.append(self.manual_prefix)
 
-        if self.identity_name:
-            lines.append(f"MT: {self.identity_name}")
+        # if self.identity_name:
+        #     lines.append(f"MT: {self.identity_name}")
 
-        if self.mikrotik_host:
-            lines.append(f"HOST: {self.mikrotik_host}:{self.ssh_port}")
+        # if self.mikrotik_host:
+        #     lines.append(f"HOST: {self.mikrotik_host}:{self.ssh_port}")
 
-        if self.mikrotik_interface:
-            lines.append(f"IF: {self.mikrotik_interface}")
+        # if self.mikrotik_interface:
+        #     lines.append(f"IF: {self.mikrotik_interface}")
 
         if error_text:
             lines.append(f"STATUS: {error_text}")
@@ -882,10 +887,10 @@ class UdpVideoWindow:
             lines.append(" | ".join(wl_dist))
 
         extras = []
-        if temperature:
-            extras.append(f"TEMP: {temperature}")
-        if voltage:
-            extras.append(f"VCC: {voltage}")
+        # if temperature:
+        #     extras.append(f"TEMP: {temperature}")
+        # if voltage:
+        #     extras.append(f"VCC: {voltage}")
 
         if extras:
             lines.append(" | ".join(extras))

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional, List, Tuple
 
 import gi
@@ -22,6 +23,8 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gtk, Gst, GLib
 
 Gst.init(None)
+
+SETTINGS_FILE = Path(__file__).resolve().parent / "ground_station_settings.json"
 
 
 def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
@@ -294,7 +297,9 @@ class MikroTikSshClient:
             elif "sfp-model:" in lower:
                 model = line.split(":", 1)[1].strip()
 
-        extra_text = " ".join(x for x in [vendor_name, vendor_part, model] if x)
+        extra_text = " ".join(
+            x for x in [vendor_name, vendor_part, model] if x
+        )
 
         wavelength = normalize_wavelength_text(wavelength) or infer_wavelength_from_text(extra_text)
         distance = normalize_distance_text(distance) or infer_distance_from_text(extra_text)
@@ -602,13 +607,7 @@ class UdpVideoWindow:
 
         self.auto_controller_enabled = not bool(self.serial_dev)
 
-        # OSD settings
-        self.overlay_xpad = 220
-        self.overlay_ypad = 110
-        self.overlay_font_size = 8
-        self.overlay_background = False
-        self.overlay_halign = "right"
-        self.overlay_valign = "bottom"
+        self.load_osd_settings()
 
         self.window = Gtk.Window(title="UDP Video Viewer + MikroTik SFP Monitor")
         self.window.set_default_size(1100, 700)
@@ -686,6 +685,60 @@ class UdpVideoWindow:
             daemon=True,
         )
         self.controller_watch_thread.start()
+
+    def set_default_osd_settings(self):
+        self.overlay_xpad = 0
+        self.overlay_ypad = 400
+        self.overlay_font_size = 8
+        self.overlay_background = False
+        self.overlay_halign = "right"
+        self.overlay_valign = "top"
+
+    def load_osd_settings(self):
+        self.set_default_osd_settings()
+
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            self.overlay_xpad = int(data.get("xpad", self.overlay_xpad))
+            self.overlay_ypad = int(data.get("ypad", self.overlay_ypad))
+            self.overlay_font_size = int(data.get("font_size", self.overlay_font_size))
+            self.overlay_background = bool(data.get("background", self.overlay_background))
+
+            halign = str(data.get("halign", self.overlay_halign)).lower()
+            if halign in ("left", "right"):
+                self.overlay_halign = halign
+
+            valign = str(data.get("valign", self.overlay_valign)).lower()
+            if valign in ("top", "bottom"):
+                self.overlay_valign = valign
+
+            print(f"[INFO] OSD settings loaded from {SETTINGS_FILE}", flush=True)
+
+        except FileNotFoundError:
+            print("[INFO] OSD settings file not found, using defaults", flush=True)
+        except Exception as e:
+            print(f"[WARN] Failed to load OSD settings: {e}", file=sys.stderr)
+
+    def save_osd_settings(self):
+        data = {
+            "xpad": self.overlay_xpad,
+            "ypad": self.overlay_ypad,
+            "font_size": self.overlay_font_size,
+            "background": self.overlay_background,
+            "halign": self.overlay_halign,
+            "valign": self.overlay_valign,
+        }
+
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+
+            print(f"[INFO] OSD settings saved to {SETTINGS_FILE}", flush=True)
+
+        except Exception as e:
+            print(f"[ERROR] Failed to save OSD settings: {e}", file=sys.stderr)
 
     def build_pipeline(self, port: int, mode: str, text: str) -> str:
         safe_text = self.escape_gst_text(text)
@@ -829,10 +882,11 @@ class UdpVideoWindow:
 
     def open_osd_settings(self, widget):
         dialog = Gtk.Dialog(
-            title="Налаштування OSD",
+            title="Налаштування наземної станції",
             transient_for=self.window,
             flags=0,
         )
+        dialog.add_button("Reset", 1)
         dialog.add_button("Скасувати", Gtk.ResponseType.CANCEL)
         dialog.add_button("Застосувати", Gtk.ResponseType.OK)
 
@@ -905,17 +959,35 @@ class UdpVideoWindow:
         combo_valign.set_active_id(self.overlay_valign)
         grid.attach(combo_valign, 1, row, 1, 1)
 
-        dialog.show_all()
-        response = dialog.run()
+        def apply_defaults_to_widgets():
+            spin_x.set_value(0)
+            spin_y.set_value(400)
+            spin_font.set_value(8)
+            chk_bg.set_active(False)
+            combo_halign.set_active_id("right")
+            combo_valign.set_active_id("top")
 
-        if response == Gtk.ResponseType.OK:
-            self.overlay_xpad = spin_x.get_value_as_int()
-            self.overlay_ypad = spin_y.get_value_as_int()
-            self.overlay_font_size = spin_font.get_value_as_int()
-            self.overlay_background = chk_bg.get_active()
-            self.overlay_halign = combo_halign.get_active_id() or "right"
-            self.overlay_valign = combo_valign.get_active_id() or "bottom"
-            self.restart_video_pipeline()
+        dialog.show_all()
+
+        while True:
+            response = dialog.run()
+
+            if response == 1:
+                apply_defaults_to_widgets()
+                continue
+
+            if response == Gtk.ResponseType.OK:
+                self.overlay_xpad = spin_x.get_value_as_int()
+                self.overlay_ypad = spin_y.get_value_as_int()
+                self.overlay_font_size = spin_font.get_value_as_int()
+                self.overlay_background = chk_bg.get_active()
+                self.overlay_halign = combo_halign.get_active_id() or "right"
+                self.overlay_valign = combo_valign.get_active_id() or "top"
+
+                self.save_osd_settings()
+                self.restart_video_pipeline()
+
+            break
 
         dialog.destroy()
 

@@ -77,10 +77,7 @@ def parse_dbm_value(value: Optional[str]) -> Optional[float]:
     if not value:
         return None
 
-    cleaned = value.strip().lower()
-    cleaned = cleaned.replace("dbm", "").strip()
-
-    # лишаємо тільки число з можливим знаком і крапкою
+    cleaned = value.strip().lower().replace("dbm", "").strip()
     match = re.search(r"[-+]?\d+(?:\.\d+)?", cleaned)
     if not match:
         return None
@@ -150,7 +147,6 @@ def infer_distance_from_text(text: str) -> Optional[str]:
     if not text:
         return None
 
-    # Явний формат: 20km / 20 km
     match = re.search(r"\b(\d+(?:\.\d+)?)\s*km\b", text, re.IGNORECASE)
     if match:
         return f"{match.group(1)}km"
@@ -170,10 +166,7 @@ def infer_distance_from_text(text: str) -> Optional[str]:
 
 def find_controller_serial_device() -> Optional[str]:
     for p in list_ports.comports():
-        if (
-            p.manufacturer == "Raspberry Pi"
-            and p.product == "Pico"
-        ):
+        if p.manufacturer == "Raspberry Pi" and p.product == "Pico":
             return p.device
     return None
 
@@ -188,7 +181,6 @@ class MikroTikSshClient:
 
     def connect(self):
         self.disconnect()
-
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self.client.connect(
@@ -289,6 +281,8 @@ class MikroTikSshClient:
                 wavelength = line.split(":", 1)[1].strip()
             elif "sfp-link-length-sm:" in lower:
                 distance = line.split(":", 1)[1].strip()
+            elif "sfp-link-length:" in lower:
+                distance = line.split(":", 1)[1].strip()
             elif "sfp-length:" in lower:
                 distance = line.split(":", 1)[1].strip()
             elif "sfp-vendor-name:" in lower:
@@ -300,9 +294,7 @@ class MikroTikSshClient:
             elif "sfp-model:" in lower:
                 model = line.split(":", 1)[1].strip()
 
-        extra_text = " ".join(
-            x for x in [vendor_name, vendor_part, model] if x
-        )
+        extra_text = " ".join(x for x in [vendor_name, vendor_part, model] if x)
 
         wavelength = normalize_wavelength_text(wavelength) or infer_wavelength_from_text(extra_text)
         distance = normalize_distance_text(distance) or infer_distance_from_text(extra_text)
@@ -610,6 +602,14 @@ class UdpVideoWindow:
 
         self.auto_controller_enabled = not bool(self.serial_dev)
 
+        # OSD settings
+        self.overlay_xpad = 220
+        self.overlay_ypad = 110
+        self.overlay_font_size = 8
+        self.overlay_background = False
+        self.overlay_halign = "right"
+        self.overlay_valign = "bottom"
+
         self.window = Gtk.Window(title="UDP Video Viewer + MikroTik SFP Monitor")
         self.window.set_default_size(1100, 700)
         self.window.set_keep_above(always_on_top)
@@ -634,6 +634,10 @@ class UdpVideoWindow:
         btn_clear = Gtk.Button(label="Очистити")
         btn_clear.connect("clicked", self.clear_prefix)
         top_bar.pack_start(btn_clear, False, False, 0)
+
+        btn_osd = Gtk.Button(label="OSD...")
+        btn_osd.connect("clicked", self.open_osd_settings)
+        top_bar.pack_start(btn_osd, False, False, 0)
 
         self.info_label = Gtk.Label(label="Video init...")
         self.info_label.set_xalign(0.0)
@@ -685,6 +689,7 @@ class UdpVideoWindow:
 
     def build_pipeline(self, port: int, mode: str, text: str) -> str:
         safe_text = self.escape_gst_text(text)
+        bg_value = "true" if self.overlay_background else "false"
 
         if mode == "raw":
             return f"""
@@ -696,12 +701,12 @@ class UdpVideoWindow:
                 ! videoconvert
                 ! textoverlay name=overlay
                     text="{safe_text}"
-                    valignment=bottom
-                    halignment=right
-                    shaded-background=false
-                    xpad=220
-                    ypad=110
-                    font-desc="Sans Bold 8"
+                    valignment={self.overlay_valign}
+                    halignment={self.overlay_halign}
+                    shaded-background={bg_value}
+                    xpad={self.overlay_xpad}
+                    ypad={self.overlay_ypad}
+                    font-desc="Sans Bold {self.overlay_font_size}"
                 ! gtksink name=videosink sync=false
             """
 
@@ -717,12 +722,12 @@ class UdpVideoWindow:
                 ! videoconvert
                 ! textoverlay name=overlay
                     text="{safe_text}"
-                    valignment=bottom
-                    halignment=right
-                    shaded-background=false
-                    xpad=220
-                    ypad=110
-                    font-desc="Sans Bold 8"
+                    valignment={self.overlay_valign}
+                    halignment={self.overlay_halign}
+                    shaded-background={bg_value}
+                    xpad={self.overlay_xpad}
+                    ypad={self.overlay_ypad}
+                    font-desc="Sans Bold {self.overlay_font_size}"
                 ! gtksink name=videosink sync=false
             """
 
@@ -734,10 +739,12 @@ class UdpVideoWindow:
 
     def apply_prefix(self, widget):
         self.manual_prefix = self.entry.get_text().strip()
+        self.refresh_overlay_text_only()
 
     def clear_prefix(self, widget):
         self.entry.set_text("")
         self.manual_prefix = ""
+        self.refresh_overlay_text_only()
 
     def set_overlay_text(self, text: str):
         GLib.idle_add(self.overlay.set_property, "text", text)
@@ -762,6 +769,155 @@ class UdpVideoWindow:
                 lines.append(f"Controller bridge: configured serial {self.serial_dev}, not running")
 
         return "\n".join(lines)
+
+    def refresh_overlay_text_only(self):
+        try:
+            text = self.build_overlay_text(
+                rx_power=None,
+                tx_power=None,
+                temperature=None,
+                voltage=None,
+                wavelength=None,
+                distance=None,
+            )
+            self.set_overlay_text(text)
+        except Exception:
+            pass
+
+    def restart_video_pipeline(self):
+        old_text = ""
+        try:
+            old_text = self.overlay.get_property("text")
+        except Exception:
+            pass
+
+        try:
+            self.pipeline.set_state(Gst.State.NULL)
+        except Exception:
+            pass
+
+        pipeline_str = self.build_pipeline(
+            self.port,
+            self.mode,
+            old_text or "Connecting to MikroTik SSH...",
+        )
+        print("Restart pipeline:")
+        print(pipeline_str)
+
+        self.pipeline = Gst.parse_launch(pipeline_str)
+        self.overlay = self.pipeline.get_by_name("overlay")
+        self.video_sink = self.pipeline.get_by_name("videosink")
+
+        if self.overlay is None:
+            raise RuntimeError("Не вдалося знайти textoverlay")
+        if self.video_sink is None:
+            raise RuntimeError("Не вдалося знайти gtksink")
+
+        video_widget = self.video_sink.props.widget
+
+        for child in self.video_box.get_children():
+            self.video_box.remove(child)
+
+        self.video_box.pack_start(video_widget, True, True, 0)
+        self.video_box.show_all()
+
+        self.bus = self.pipeline.get_bus()
+        self.bus.add_signal_watch()
+        self.bus.connect("message", self.on_bus_message)
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+    def open_osd_settings(self, widget):
+        dialog = Gtk.Dialog(
+            title="Налаштування OSD",
+            transient_for=self.window,
+            flags=0,
+        )
+        dialog.add_button("Скасувати", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Застосувати", Gtk.ResponseType.OK)
+
+        content = dialog.get_content_area()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(10)
+        content.add(box)
+
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10)
+        box.pack_start(grid, True, True, 0)
+
+        row = 0
+
+        lbl_x = Gtk.Label(label="X:")
+        lbl_x.set_xalign(0.0)
+        grid.attach(lbl_x, 0, row, 1, 1)
+
+        spin_x = Gtk.SpinButton()
+        spin_x.set_range(0, 5000)
+        spin_x.set_increments(1, 10)
+        spin_x.set_value(self.overlay_xpad)
+        grid.attach(spin_x, 1, row, 1, 1)
+        row += 1
+
+        lbl_y = Gtk.Label(label="Y:")
+        lbl_y.set_xalign(0.0)
+        grid.attach(lbl_y, 0, row, 1, 1)
+
+        spin_y = Gtk.SpinButton()
+        spin_y.set_range(0, 5000)
+        spin_y.set_increments(1, 10)
+        spin_y.set_value(self.overlay_ypad)
+        grid.attach(spin_y, 1, row, 1, 1)
+        row += 1
+
+        lbl_font = Gtk.Label(label="Font size:")
+        lbl_font.set_xalign(0.0)
+        grid.attach(lbl_font, 0, row, 1, 1)
+
+        spin_font = Gtk.SpinButton()
+        spin_font.set_range(6, 72)
+        spin_font.set_increments(1, 2)
+        spin_font.set_value(self.overlay_font_size)
+        grid.attach(spin_font, 1, row, 1, 1)
+        row += 1
+
+        chk_bg = Gtk.CheckButton(label="Background")
+        chk_bg.set_active(self.overlay_background)
+        grid.attach(chk_bg, 0, row, 2, 1)
+        row += 1
+
+        lbl_halign = Gtk.Label(label="Horizontal:")
+        lbl_halign.set_xalign(0.0)
+        grid.attach(lbl_halign, 0, row, 1, 1)
+
+        combo_halign = Gtk.ComboBoxText()
+        combo_halign.append("left", "Left")
+        combo_halign.append("right", "Right")
+        combo_halign.set_active_id(self.overlay_halign)
+        grid.attach(combo_halign, 1, row, 1, 1)
+        row += 1
+
+        lbl_valign = Gtk.Label(label="Vertical:")
+        lbl_valign.set_xalign(0.0)
+        grid.attach(lbl_valign, 0, row, 1, 1)
+
+        combo_valign = Gtk.ComboBoxText()
+        combo_valign.append("top", "Top")
+        combo_valign.append("bottom", "Bottom")
+        combo_valign.set_active_id(self.overlay_valign)
+        grid.attach(combo_valign, 1, row, 1, 1)
+
+        dialog.show_all()
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            self.overlay_xpad = spin_x.get_value_as_int()
+            self.overlay_ypad = spin_y.get_value_as_int()
+            self.overlay_font_size = spin_font.get_value_as_int()
+            self.overlay_background = chk_bg.get_active()
+            self.overlay_halign = combo_halign.get_active_id() or "right"
+            self.overlay_valign = combo_valign.get_active_id() or "bottom"
+            self.restart_video_pipeline()
+
+        dialog.destroy()
 
     def ensure_bridge_running(self):
         if not self.bridge_remote_host:

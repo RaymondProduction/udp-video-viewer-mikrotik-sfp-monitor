@@ -2,16 +2,17 @@
 import argparse
 import binascii
 import ipaddress
+import json
 import socket
+import subprocess
 import sys
 import threading
 import time
 from typing import Optional, List
 
-import cv2
+import gi
 import numpy as np
 import paramiko
-import psutil
 import serial
 from serial.tools import list_ports
 
@@ -20,55 +21,64 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
     QGridLayout,
-    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QSpinBox,
-    QDoubleSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
-    QComboBox,
 )
+
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst, GLib
+
+Gst.init(None)
 
 
 def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
     result = []
-    seen = set()
+    try:
+        output = subprocess.check_output(
+            ["ip", "-j", "-4", "addr", "show", "up"],
+            text=True,
+        )
+        data = json.loads(output)
 
-    for iface_name, addrs in psutil.net_if_addrs().items():
-        for addr in addrs:
-            if addr.family != socket.AF_INET:
-                continue
+        for iface in data:
+            for addr_info in iface.get("addr_info", []):
+                local = addr_info.get("local")
+                prefixlen = addr_info.get("prefixlen")
+                if not local or prefixlen is None:
+                    continue
 
-            ip = addr.address
-            netmask = addr.netmask
-
-            if not ip or not netmask:
-                continue
-
-            try:
-                ip_obj = ipaddress.ip_address(ip)
+                ip_obj = ipaddress.ip_address(local)
                 if ip_obj.is_loopback:
                     continue
 
-                network = ipaddress.ip_network(f"{ip}/{netmask}", strict=False)
+                network = ipaddress.ip_network(f"{local}/{prefixlen}", strict=False)
 
                 if network.prefixlen < 24:
-                    network = ipaddress.ip_network(f"{ip}/24", strict=False)
+                    network = ipaddress.ip_network(f"{local}/24", strict=False)
 
-                net_str = str(network)
-                if net_str not in seen:
-                    seen.add(net_str)
-                    result.append(network)
-            except Exception:
-                continue
+                result.append(network)
 
-    return result
+    except Exception as e:
+        print(f"Не вдалося отримати локальні інтерфейси: {e}", file=sys.stderr)
+
+    unique = []
+    seen = set()
+    for net in result:
+        net_str = str(net)
+        if net_str not in seen:
+            unique.append(net)
+            seen.add(net_str)
+
+    return unique
 
 
 def tcp_connectable(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -81,25 +91,14 @@ def tcp_connectable(host: str, port: int, timeout: float = 0.5) -> bool:
 
 def find_controller_serial_device() -> Optional[str]:
     for p in list_ports.comports():
-        text = " ".join(
-            str(x)
-            for x in [p.device, p.description, p.manufacturer, p.product, p.hwid]
-            if x
-        ).lower()
-
-        if "raspberry pi pico" in text or " pico " in f" {text} " or text.endswith(" pico"):
-            return p.device
-
         if p.manufacturer == "Raspberry Pi" and p.product == "Pico":
             return p.device
-
     return None
 
 
-class LogEmitter(QObject):
-    line = Signal(str)
+class UiSignals(QObject):
+    log_line = Signal(str)
     info_text = Signal(str)
-    overlay_text = Signal(str)
     frame_ready = Signal(QImage)
 
 
@@ -216,12 +215,12 @@ def try_mikrotik_ssh(host: str, username: str, password: str, port: int) -> bool
             client.disconnect()
 
 
-def auto_discover_mikrotik(username: str, password: str, port: int, logger: LogEmitter) -> Optional[str]:
+def auto_discover_mikrotik(username: str, password: str, port: int) -> Optional[str]:
     networks = get_local_ipv4_networks()
-    logger.line.emit(f"Локальні мережі для сканування: {[str(n) for n in networks]}")
+    print("Локальні мережі для сканування:", [str(n) for n in networks])
 
     for network in networks:
-        logger.line.emit(f"Сканую мережу {network} ...")
+        print(f"Сканую мережу {network} ...")
         hosts = list(network.hosts())
 
         if len(hosts) > 254:
@@ -239,7 +238,7 @@ def auto_discover_mikrotik(username: str, password: str, port: int, logger: LogE
                 password=password,
                 port=port,
             ):
-                logger.line.emit(f"Знайдено MikroTik через SSH: {ip}:{port}")
+                print(f"Знайдено MikroTik через SSH: {ip}:{port}")
                 return ip
 
     return None
@@ -252,13 +251,13 @@ class UdpSerialBridge:
         remote_port: int,
         serial_dev: str,
         baudrate: int,
-        logger: LogEmitter,
         local_bind_ip: str = "0.0.0.0",
         local_bind_port: int = 0,
         serial_timeout: float = 0.01,
         udp_timeout: float = 0.2,
         verbose: bool = False,
         hex_dump: bool = False,
+        log_fn=None,
     ):
         self.remote_host = remote_host
         self.remote_port = remote_port
@@ -270,7 +269,7 @@ class UdpSerialBridge:
         self.udp_timeout = udp_timeout
         self.verbose = verbose
         self.hex_dump = hex_dump
-        self.logger = logger
+        self.log_fn = log_fn or print
 
         self.running = False
         self.sock: Optional[socket.socket] = None
@@ -288,13 +287,13 @@ class UdpSerialBridge:
 
     def log(self, text: str):
         if self.verbose:
-            self.logger.line.emit(f"[BRIDGE] {text}")
+            self.log_fn(f"[BRIDGE] {text}")
 
     def info(self, text: str):
-        self.logger.line.emit(f"[INFO] {text}")
+        self.log_fn(f"[INFO] {text}")
 
     def err(self, text: str):
-        self.logger.line.emit(f"[ERROR] {text}")
+        self.log_fn(f"[ERROR] {text}")
 
     @staticmethod
     def short_hex(data: bytes, max_len: int = 64) -> str:
@@ -309,9 +308,7 @@ class UdpSerialBridge:
     def start(self):
         self.stop()
 
-        self.info(
-            f"Opening serial: {self.serial_dev} @ {self.baudrate} (8N1, no flow control)"
-        )
+        self.info(f"Opening serial: {self.serial_dev} @ {self.baudrate} (8N1, no flow control)")
         self.ser = serial.Serial(
             port=self.serial_dev,
             baudrate=self.baudrate,
@@ -338,16 +335,8 @@ class UdpSerialBridge:
 
         self.running = True
 
-        self.t_udp_to_serial = threading.Thread(
-            target=self.udp_to_serial_loop,
-            daemon=True,
-            name="udp_to_serial",
-        )
-        self.t_serial_to_udp = threading.Thread(
-            target=self.serial_to_udp_loop,
-            daemon=True,
-            name="serial_to_udp",
-        )
+        self.t_udp_to_serial = threading.Thread(target=self.udp_to_serial_loop, daemon=True)
+        self.t_serial_to_udp = threading.Thread(target=self.serial_to_udp_loop, daemon=True)
 
         self.t_udp_to_serial.start()
         self.t_serial_to_udp.start()
@@ -441,118 +430,171 @@ class UdpSerialBridge:
         )
 
 
-class VideoWorker:
-    def __init__(self, port: int, mode: str, logger: LogEmitter):
+class GstVideoController:
+    def __init__(self, port: int, mode: str, frame_callback, log_fn):
         self.port = port
         self.mode = mode
-        self.logger = logger
-        self.running = False
-        self.thread: Optional[threading.Thread] = None
-        self.overlay_text = "Video starting..."
-        self.lock = threading.Lock()
+        self.frame_callback = frame_callback
+        self.log_fn = log_fn
 
-    def set_overlay_text(self, text: str):
-        with self.lock:
-            self.overlay_text = text
+        self.pipeline: Optional[Gst.Element] = None
+        self.overlay: Optional[Gst.Element] = None
+        self.appsink: Optional[Gst.Element] = None
+        self.bus: Optional[Gst.Bus] = None
 
-    def get_overlay_text(self) -> str:
-        with self.lock:
-            return self.overlay_text
+    @staticmethod
+    def escape_gst_text(text: str) -> str:
+        return text.replace("\\", "\\\\").replace('"', '\\"')
 
-    def build_source(self) -> str:
-        if self.mode == "raw":
-            return f"udp://0.0.0.0:{self.port}"
-        if self.mode == "rtp":
-            return f"udp://0.0.0.0:{self.port}"
-        raise ValueError("Невідомий режим")
+    def build_pipeline(self, port: int, mode: str, text: str) -> str:
+        safe_text = self.escape_gst_text(text)
+
+        if mode == "raw":
+            return f"""
+                udpsrc port={port}
+                    caps="video/x-h264,stream-format=byte-stream,alignment=au"
+                ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 leaky=downstream
+                ! h264parse config-interval=-1 disable-passthrough=true
+                ! decodebin
+                ! videoconvert
+                ! video/x-raw,format=RGB
+                ! textoverlay name=overlay
+                    text="{safe_text}"
+                    valignment=top
+                    halignment=left
+                    shaded-background=true
+                    font-desc="Sans 14"
+                ! videoconvert
+                ! video/x-raw,format=RGB
+                ! appsink name=videosink emit-signals=true max-buffers=1 drop=true sync=false
+            """
+
+        if mode == "rtp":
+            return f"""
+                udpsrc port={port}
+                    caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"
+                ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 leaky=downstream
+                ! rtpjitterbuffer latency=30 drop-on-latency=true
+                ! rtph264depay
+                ! h264parse config-interval=-1 disable-passthrough=true
+                ! avdec_h264
+                ! videoconvert
+                ! video/x-raw,format=RGB
+                ! textoverlay name=overlay
+                    text="{safe_text}"
+                    valignment=top
+                    halignment=left
+                    shaded-background=true
+                    font-desc="Sans 14"
+                ! videoconvert
+                ! video/x-raw,format=RGB
+                ! appsink name=videosink emit-signals=true max-buffers=1 drop=true sync=false
+            """
+
+        raise ValueError("Невідомий режим. Використовуйте raw або rtp.")
 
     def start(self):
-        if self.running:
-            return
-        self.running = True
-        self.thread = threading.Thread(target=self.run, daemon=True, name="video_worker")
-        self.thread.start()
+        pipeline_str = self.build_pipeline(self.port, self.mode, "Connecting to MikroTik SSH...")
+        self.log_fn("Pipeline:")
+        self.log_fn(pipeline_str)
+
+        self.pipeline = Gst.parse_launch(pipeline_str)
+        self.overlay = self.pipeline.get_by_name("overlay")
+        self.appsink = self.pipeline.get_by_name("videosink")
+
+        if self.overlay is None:
+            raise RuntimeError("Не вдалося знайти textoverlay")
+        if self.appsink is None:
+            raise RuntimeError("Не вдалося знайти appsink")
+
+        self.appsink.connect("new-sample", self.on_new_sample)
+
+        self.bus = self.pipeline.get_bus()
+        self.bus.add_signal_watch()
+        self.bus.connect("message", self.on_bus_message)
+
+        self.pipeline.set_state(Gst.State.PLAYING)
 
     def stop(self):
-        self.running = False
+        if self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+        self.pipeline = None
+        self.overlay = None
+        self.appsink = None
+        self.bus = None
 
-    def draw_overlay(self, frame: np.ndarray, text: str) -> np.ndarray:
-        lines = text.splitlines()
-        if not lines:
-            return frame
+    def restart(self, port: int, mode: str):
+        self.stop()
+        self.port = port
+        self.mode = mode
+        self.start()
 
-        x = 10
-        y = 25
-        line_h = 22
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.55
-        thickness = 1
+    def set_overlay_text(self, text: str):
+        if self.overlay is not None:
+            self.overlay.set_property("text", text)
 
-        max_w = 0
-        for line in lines:
-            (w, h), _ = cv2.getTextSize(line, font, scale, thickness)
-            max_w = max(max_w, w)
+    def on_new_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.ERROR
 
-        box_h = len(lines) * line_h + 12
-        box_w = max_w + 20
+        buffer = sample.get_buffer()
+        caps = sample.get_caps()
+        structure = caps.get_structure(0)
 
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (5, 5), (5 + box_w, 5 + box_h), (0, 0, 0), -1)
-        frame = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
+        width = structure.get_value("width")
+        height = structure.get_value("height")
 
-        for i, line in enumerate(lines):
-            yy = y + i * line_h
-            cv2.putText(frame, line, (x, yy), font, scale, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(frame, line, (x, yy), font, scale, (0, 255, 0), 1, cv2.LINE_AA)
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.ERROR
 
-        return frame
+        try:
+            arr = np.frombuffer(map_info.data, dtype=np.uint8)
+            expected = width * height * 3
+            if arr.size < expected:
+                return Gst.FlowReturn.OK
 
-    def run(self):
-        src = self.build_source()
-        self.logger.line.emit(f"[VIDEO] Opening source: {src}")
+            arr = arr[:expected].reshape((height, width, 3))
+            image = QImage(arr.data, width, height, width * 3, QImage.Format_RGB888).copy()
+            self.frame_callback(image)
+        finally:
+            buffer.unmap(map_info)
 
-        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        return Gst.FlowReturn.OK
 
-        if not cap.isOpened():
-            self.logger.line.emit("[VIDEO] Не вдалося відкрити відеопотік через OpenCV/FFmpeg")
-            self.logger.line.emit("[VIDEO] Спробуйте інший режим потоку або іншу OpenCV build")
-            self.running = False
-            return
+    def on_bus_message(self, bus, message):
+        msg_type = message.type
 
-        while self.running:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                time.sleep(0.02)
-                continue
+        if msg_type == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            self.log_fn(f"GStreamer ERROR: {err}")
+            if debug:
+                self.log_fn(f"DEBUG: {debug}")
 
-            text = self.get_overlay_text()
-            frame = self.draw_overlay(frame, text)
+        elif msg_type == Gst.MessageType.WARNING:
+            warn, debug = message.parse_warning()
+            self.log_fn(f"GStreamer WARNING: {warn}")
+            if debug:
+                self.log_fn(f"DEBUG: {debug}")
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb.shape
-            bytes_per_line = ch * w
-            image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
-            self.logger.frame_ready.emit(image)
-
-        cap.release()
+        elif msg_type == Gst.MessageType.EOS:
+            self.log_fn("Кінець потоку")
 
 
 class MainWindow(QMainWindow):
     def __init__(self, args):
         super().__init__()
 
-        self.setWindowTitle("UDP Video Viewer + MikroTik SFP Monitor (Qt)")
+        self.setWindowTitle("UDP Video Viewer + MikroTik SFP Monitor (Qt + GStreamer)")
         self.resize(1280, 900)
         if args.always_on_top:
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
-        self.logger = LogEmitter()
-        self.logger.line.connect(self.append_log)
-        self.logger.info_text.connect(self.set_info_text)
-        self.logger.overlay_text.connect(self.set_overlay_text)
-        self.logger.frame_ready.connect(self.update_video_frame)
-
-        self.running = True
+        self.signals = UiSignals()
+        self.signals.log_line.connect(self.append_log)
+        self.signals.info_text.connect(self.set_info_text)
+        self.signals.frame_ready.connect(self.update_video_frame)
 
         self.port = args.port
         self.mode = args.mode
@@ -574,16 +616,22 @@ class MainWindow(QMainWindow):
 
         self.auto_controller_enabled = not bool(self.serial_dev)
 
-        self.identity_name = ""
+        self.running = True
         self.manual_prefix = ""
+        self.identity_name = ""
+
         self.bridge: Optional[UdpSerialBridge] = None
         self.mt_client: Optional[MikroTikSshClient] = None
 
-        self.video_worker = VideoWorker(self.port, self.mode, self.logger)
-
         self.build_ui()
 
-        self.video_worker.start()
+        self.video = GstVideoController(
+            port=self.port,
+            mode=self.mode,
+            frame_callback=lambda img: self.signals.frame_ready.emit(img),
+            log_fn=lambda text: self.signals.log_line.emit(text),
+        )
+        self.video.start()
 
         if self.bridge_remote_host:
             self.ensure_bridge_running()
@@ -608,7 +656,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
-
         controls = QGridLayout()
         root.addLayout(controls)
 
@@ -660,7 +707,6 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.bridge_hex_check, 2, 2, 1, 2)
 
         self.info_label = QLabel("Init...")
-        self.info_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.info_label.setWordWrap(True)
         root.addWidget(self.info_label)
 
@@ -681,9 +727,6 @@ class MainWindow(QMainWindow):
     def set_info_text(self, text: str):
         self.info_label.setText(text)
 
-    def set_overlay_text(self, text: str):
-        self.video_worker.set_overlay_text(text)
-
     def update_video_frame(self, image: QImage):
         pix = QPixmap.fromImage(image)
         if not self.video_label.size().isEmpty():
@@ -697,12 +740,12 @@ class MainWindow(QMainWindow):
     def mode_changed(self, value: str):
         self.mode = value
         self.append_log(f"[UI] Mode changed to {value}")
-        self.restart_video()
+        self.video.restart(self.port, self.mode)
 
     def port_changed(self, value: int):
         self.port = value
         self.append_log(f"[UI] Port changed to {value}")
-        self.restart_video()
+        self.video.restart(self.port, self.mode)
 
     def poll_changed(self, value: float):
         self.poll_interval = max(0.5, value)
@@ -715,15 +758,6 @@ class MainWindow(QMainWindow):
         self.prefix_edit.setText("")
         self.manual_prefix = ""
         self.refresh_overlay_and_info()
-
-    def restart_video(self):
-        try:
-            self.video_worker.stop()
-            time.sleep(0.2)
-        except Exception:
-            pass
-        self.video_worker = VideoWorker(self.port, self.mode, self.logger)
-        self.video_worker.start()
 
     def build_info_text(self) -> str:
         mt_host = self.mikrotik_host or "N/A"
@@ -784,7 +818,8 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def refresh_overlay_and_info(self):
-        self.info_label.setText(self.build_info_text())
+        self.set_info_text(self.build_info_text())
+        self.video.set_overlay_text(self.build_overlay_text(None, None, None, None))
 
     def ensure_bridge_running(self):
         if not self.bridge_remote_host:
@@ -814,11 +849,11 @@ class MainWindow(QMainWindow):
                 remote_port=self.bridge_remote_port,
                 serial_dev=serial_dev_to_use,
                 baudrate=self.serial_baudrate,
-                logger=self.logger,
                 local_bind_ip=self.bridge_local_bind_ip,
                 local_bind_port=self.bridge_local_bind_port,
                 verbose=self.bridge_verbose_check.isChecked(),
                 hex_dump=self.bridge_hex_check.isChecked(),
+                log_fn=lambda text: self.signals.log_line.emit(text),
             )
             self.bridge.start()
             self.serial_dev = serial_dev_to_use
@@ -838,9 +873,9 @@ class MainWindow(QMainWindow):
 
                 if found != last_seen:
                     if found:
-                        self.logger.line.emit(f"[INFO] Controller detected: {found}")
+                        self.signals.log_line.emit(f"[INFO] Controller detected: {found}")
                     else:
-                        self.logger.line.emit("[INFO] Controller disconnected")
+                        self.signals.log_line.emit("[INFO] Controller disconnected")
                     last_seen = found
 
                 if self.auto_controller_enabled:
@@ -850,7 +885,7 @@ class MainWindow(QMainWindow):
                             self.ensure_bridge_running()
                     else:
                         if self.bridge is not None:
-                            self.logger.line.emit("[INFO] Stopping bridge because controller disappeared")
+                            self.signals.log_line.emit("[INFO] Stopping bridge because controller disappeared")
                             try:
                                 self.bridge.stop()
                             except Exception:
@@ -861,27 +896,26 @@ class MainWindow(QMainWindow):
                     if self.bridge is None and self.serial_dev:
                         self.ensure_bridge_running()
 
-                self.logger.info_text.emit(self.build_info_text())
+                self.signals.info_text.emit(self.build_info_text())
 
             except Exception as e:
-                self.logger.line.emit(f"[WARN] controller_watch_loop: {e}")
+                self.signals.log_line.emit(f"[WARN] controller_watch_loop: {e}")
 
             time.sleep(1.0)
 
     def ensure_mikrotik_ready(self) -> bool:
         if not self.mikrotik_host:
-            self.logger.overlay_text.emit("STATUS: Searching MikroTik via SSH...")
+            self.video.set_overlay_text("STATUS: Searching MikroTik via SSH...")
             found = auto_discover_mikrotik(
                 username=self.mikrotik_user,
                 password=self.mikrotik_password,
                 port=self.ssh_port,
-                logger=self.logger,
             )
             if not found:
-                self.logger.overlay_text.emit(
-                    "STATUS: MikroTik not found by SSH scan\nCheck IP connectivity or set host"
+                self.video.set_overlay_text(
+                    "STATUS: MikroTik not found by SSH scan\nCheck IP connectivity or set --mikrotik-host"
                 )
-                self.logger.info_text.emit(self.build_info_text())
+                self.signals.info_text.emit(self.build_info_text())
                 return False
             self.mikrotik_host = found
 
@@ -896,17 +930,17 @@ class MainWindow(QMainWindow):
         self.identity_name = self.mt_client.get_identity() or ""
 
         if not self.mikrotik_interface:
-            self.logger.overlay_text.emit("STATUS: Searching SFP interface...")
+            self.video.set_overlay_text("STATUS: Searching SFP interface...")
             found_if = self.mt_client.auto_discover_sfp_interface()
             if not found_if:
-                self.logger.overlay_text.emit(
+                self.video.set_overlay_text(
                     f"HOST: {self.mikrotik_host}:{self.ssh_port}\nSTATUS: SFP interface not found"
                 )
-                self.logger.info_text.emit(self.build_info_text())
+                self.signals.info_text.emit(self.build_info_text())
                 return False
             self.mikrotik_interface = found_if
 
-        self.logger.info_text.emit(self.build_info_text())
+        self.signals.info_text.emit(self.build_info_text())
         return True
 
     def poll_mikrotik_loop(self):
@@ -941,18 +975,18 @@ class MainWindow(QMainWindow):
                         error_text=f"SSH ERROR: {type(e).__name__}",
                     )
 
-                self.logger.overlay_text.emit(text)
-                self.logger.info_text.emit(self.build_info_text())
+                self.video.set_overlay_text(text)
+                self.signals.info_text.emit(self.build_info_text())
                 time.sleep(self.poll_interval)
 
         except Exception as e:
-            self.logger.overlay_text.emit(f"STATUS: INIT ERROR: {type(e).__name__}")
-            self.logger.line.emit(f"Init error: {e}")
+            self.video.set_overlay_text(f"STATUS: INIT ERROR: {type(e).__name__}")
+            self.signals.log_line.emit(f"Init error: {e}")
 
     def bridge_info_loop(self):
         while self.running:
             try:
-                self.logger.info_text.emit(self.build_info_text())
+                self.signals.info_text.emit(self.build_info_text())
             except Exception:
                 pass
             time.sleep(1.0)
@@ -960,23 +994,19 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.running = False
 
-        try:
-            self.video_worker.stop()
-        except Exception:
-            pass
-
         if self.bridge is not None:
             self.bridge.stop()
 
         if self.mt_client is not None:
             self.mt_client.disconnect()
 
+        self.video.stop()
         super().closeEvent(event)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="UDP H.264 viewer with MikroTik SSH auto-discovery and optional UDP<->Serial bridge (Qt/Windows)"
+        description="UDP H.264 viewer with MikroTik SSH auto-discovery and optional UDP<->Serial bridge (Qt + GStreamer)"
     )
     parser.add_argument("--port", type=int, default=5600, help="UDP порт відео")
     parser.add_argument(
@@ -991,23 +1021,23 @@ def main():
         help="Тримати вікно поверх інших",
     )
 
-    parser.add_argument("--mikrotik-host", default="", help="IP MikroTik")
+    parser.add_argument("--mikrotik-host", default="", help="IP MikroTik. Можна не вказувати — буде автопошук по SSH")
     parser.add_argument("--mikrotik-user", default="admin", help="Логін MikroTik")
     parser.add_argument("--mikrotik-password", default="", help="Пароль MikroTik")
-    parser.add_argument("--mikrotik-interface", default="", help="SFP інтерфейс")
-    parser.add_argument("--poll-interval", type=float, default=2.0, help="Інтервал опитування")
-    parser.add_argument("--ssh-port", type=int, default=22, help="SSH порт")
+    parser.add_argument("--mikrotik-interface", default="", help="Можна не вказувати — буде автопошук SFP інтерфейсу")
+    parser.add_argument("--poll-interval", type=float, default=2.0, help="Інтервал опитування в секундах")
+    parser.add_argument("--ssh-port", type=int, default=22, help="Порт SSH MikroTik, зазвичай 22")
 
     parser.add_argument(
         "--serial-dev",
         default="",
-        help="Serial device для bridge, наприклад COM5. Якщо не вказано — автопошук Pico",
+        help="Serial device для bridge, наприклад /dev/ttyACM0. Якщо не вказано — буде автопошук Pico",
     )
     parser.add_argument("--serial-baudrate", type=int, default=420000, help="Baudrate для bridge")
-    parser.add_argument("--bridge-remote-host", default="", help="Віддалена UDP IP-адреса")
-    parser.add_argument("--bridge-remote-port", type=int, default=9000, help="Віддалений UDP порт")
-    parser.add_argument("--bridge-local-bind-ip", default="0.0.0.0", help="Локальний bind IP")
-    parser.add_argument("--bridge-local-bind-port", type=int, default=0, help="Локальний bind порт")
+    parser.add_argument("--bridge-remote-host", default="", help="Віддалена UDP IP-адреса для bridge, наприклад 192.168.121.50")
+    parser.add_argument("--bridge-remote-port", type=int, default=9000, help="Віддалений UDP порт для bridge")
+    parser.add_argument("--bridge-local-bind-ip", default="0.0.0.0", help="Локальний bind IP для bridge")
+    parser.add_argument("--bridge-local-bind-port", type=int, default=0, help="Локальний bind порт для bridge, 0 = автоматично")
     parser.add_argument("--bridge-verbose", action="store_true", help="Показувати логи bridge")
     parser.add_argument("--bridge-hex", action="store_true", help="Показувати hex у логах bridge")
 

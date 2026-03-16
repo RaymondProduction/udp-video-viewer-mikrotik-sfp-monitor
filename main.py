@@ -386,6 +386,9 @@ class UdpSerialBridge:
         self.hex_dump = hex_dump
 
         self.running = False
+        self.failed = False
+        self.fail_reason = ""
+
         self.sock: Optional[socket.socket] = None
         self.ser: Optional[serial.Serial] = None
 
@@ -398,6 +401,11 @@ class UdpSerialBridge:
 
         self.t_udp_to_serial: Optional[threading.Thread] = None
         self.t_serial_to_udp: Optional[threading.Thread] = None
+
+        now = time.time()
+        self.started_at = now
+        self.last_udp_to_serial_time = now
+        self.last_serial_to_udp_time = now
 
     def log(self, text: str):
         if self.verbose:
@@ -419,8 +427,17 @@ class UdpSerialBridge:
             txt += "..."
         return txt
 
+    def mark_failed(self, reason: str):
+        self.failed = True
+        self.fail_reason = reason
+        self.running = False
+        self.err(f"Bridge marked as failed: {reason}")
+
     def start(self):
         self.stop()
+
+        self.failed = False
+        self.fail_reason = ""
 
         self.info(
             f"Opening serial: {self.serial_dev} @ {self.baudrate} (8N1, no flow control)"
@@ -448,6 +465,11 @@ class UdpSerialBridge:
 
         local_ip, local_port = self.sock.getsockname()
         self.actual_local_addr = f"{local_ip}:{local_port}"
+
+        now = time.time()
+        self.started_at = now
+        self.last_udp_to_serial_time = now
+        self.last_serial_to_udp_time = now
 
         self.running = True
 
@@ -490,14 +512,38 @@ class UdpSerialBridge:
 
     def is_alive(self) -> bool:
         try:
-            return self.ser is not None and self.ser.is_open
+            serial_ok = self.ser is not None and self.ser.is_open
         except Exception:
-            return False
+            serial_ok = False
+
+        sock_ok = self.sock is not None
+        udp_thread_ok = self.t_udp_to_serial is not None and self.t_udp_to_serial.is_alive()
+        serial_thread_ok = self.t_serial_to_udp is not None and self.t_serial_to_udp.is_alive()
+
+        return (
+            self.running
+            and not self.failed
+            and serial_ok
+            and sock_ok
+            and udp_thread_ok
+            and serial_thread_ok
+        )
+
+    def is_stalled(self, timeout_sec: float = 3.0) -> bool:
+        if not self.running or self.failed:
+            return True
+
+        now = time.time()
+        if now - self.last_serial_to_udp_time > timeout_sec * 5:
+            return True
+
+        return False
 
     def udp_to_serial_loop(self):
         while self.running:
             try:
                 if self.sock is None or self.ser is None:
+                    self.mark_failed("udp_to_serial: socket or serial is None")
                     break
 
                 data = self.sock.recv(4096)
@@ -507,6 +553,7 @@ class UdpSerialBridge:
                 self.ser.write(data)
                 self.packets_udp_to_serial += 1
                 self.bytes_udp_to_serial += len(data)
+                self.last_udp_to_serial_time = time.time()
 
                 if self.hex_dump:
                     self.log(
@@ -517,16 +564,18 @@ class UdpSerialBridge:
 
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as e:
+                self.mark_failed(f"udp_to_serial OSError: {e}")
                 break
             except Exception as e:
-                self.err(f"udp_to_serial: {e}")
-                time.sleep(0.1)
+                self.mark_failed(f"udp_to_serial Exception: {e}")
+                break
 
     def serial_to_udp_loop(self):
         while self.running:
             try:
                 if self.sock is None or self.ser is None:
+                    self.mark_failed("serial_to_udp: socket or serial is None")
                     break
 
                 data = self.ser.read(4096)
@@ -536,6 +585,7 @@ class UdpSerialBridge:
                 self.sock.send(data)
                 self.packets_serial_to_udp += 1
                 self.bytes_serial_to_udp += len(data)
+                self.last_serial_to_udp_time = time.time()
 
                 if self.hex_dump:
                     self.log(
@@ -544,17 +594,23 @@ class UdpSerialBridge:
                 else:
                     self.log(f"SERIAL -> UDP | {len(data)} bytes")
 
-            except OSError:
+            except OSError as e:
+                self.mark_failed(f"serial_to_udp OSError: {e}")
                 break
             except Exception as e:
-                self.err(f"serial_to_udp: {e}")
-                time.sleep(0.1)
+                self.mark_failed(f"serial_to_udp Exception: {e}")
+                break
 
     def stats_text(self) -> str:
+        status = "OK"
+        if self.failed:
+            status = f"FAILED: {self.fail_reason}"
+
         return (
             f"local={self.actual_local_addr} remote={self.remote_host}:{self.remote_port} "
             f"| U->S: {self.packets_udp_to_serial} pkt / {self.bytes_udp_to_serial} B "
-            f"| S->U: {self.packets_serial_to_udp} pkt / {self.bytes_serial_to_udp} B"
+            f"| S->U: {self.packets_serial_to_udp} pkt / {self.bytes_serial_to_udp} B "
+            f"| bridge: {status}"
         )
 
 
@@ -1035,6 +1091,33 @@ class UdpVideoWindow:
         if self.bridge_remote_host:
             self.ensure_bridge_running()
 
+    def check_bridge_health(self):
+        if not self.bridge_remote_host:
+            return
+
+        if self.bridge is None:
+            self.ensure_bridge_running()
+            return
+
+        if not self.bridge.is_alive():
+            print("[WARN] Bridge is not alive, restarting...", flush=True)
+            try:
+                self.bridge.stop()
+            except Exception:
+                pass
+            self.bridge = None
+            self.ensure_bridge_running()
+            return
+
+        if self.bridge.is_stalled(timeout_sec=3.0):
+            print("[WARN] Bridge seems stalled, restarting...", flush=True)
+            try:
+                self.bridge.stop()
+            except Exception:
+                pass
+            self.bridge = None
+            self.ensure_bridge_running()
+
     def make_section(self, title: str) -> Tuple[Gtk.Frame, Gtk.Grid]:
         frame = Gtk.Frame(label=title)
         frame.set_hexpand(True)
@@ -1082,7 +1165,6 @@ class UdpVideoWindow:
         notebook.set_vexpand(True)
         outer_box.pack_start(notebook, True, True, 0)
 
-        # ---------------- OSD ----------------
         osd_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         osd_page.set_border_width(8)
 
@@ -1141,7 +1223,6 @@ class UdpVideoWindow:
         osd_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(osd_page, Gtk.Label(label="OSD"))
 
-        # ---------------- Bridge ----------------
         bridge_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         bridge_page.set_border_width(8)
 
@@ -1190,7 +1271,6 @@ class UdpVideoWindow:
         bridge_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(bridge_page, Gtk.Label(label="Міст керування"))
 
-        # ---------------- Video ----------------
         video_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         video_page.set_border_width(8)
 
@@ -1216,7 +1296,6 @@ class UdpVideoWindow:
         video_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(video_page, Gtk.Label(label="Відеопотік"))
 
-        # ---------------- MikroTik ----------------
         mt_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         mt_page.set_border_width(8)
 
@@ -1379,7 +1458,7 @@ class UdpVideoWindow:
 
                 if self.auto_controller_enabled:
                     if found:
-                        if self.bridge is None:
+                        if self.bridge is None or not self.bridge.is_alive():
                             self.serial_dev = found
                             self.ensure_bridge_running()
                     else:
@@ -1392,8 +1471,9 @@ class UdpVideoWindow:
                             self.bridge = None
                             self.serial_dev = None
                 else:
-                    if self.bridge is None and self.serial_dev:
-                        self.ensure_bridge_running()
+                    if self.bridge is None or not self.bridge.is_alive():
+                        if self.serial_dev:
+                            self.ensure_bridge_running()
 
                 self.set_info_text(self.build_info_text())
 
@@ -1526,9 +1606,10 @@ class UdpVideoWindow:
     def bridge_info_loop(self):
         while self.running:
             try:
+                self.check_bridge_health()
                 self.set_info_text(self.build_info_text())
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] bridge_info_loop: {e}", file=sys.stderr)
             time.sleep(1.0)
 
     def on_bus_message(self, bus, message):

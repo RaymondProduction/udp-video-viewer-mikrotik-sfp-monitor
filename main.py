@@ -3,6 +3,7 @@ import argparse
 import binascii
 import ipaddress
 import json
+import os
 import re
 import socket
 import subprocess
@@ -24,7 +25,21 @@ from gi.repository import Gtk, Gst, GLib, Gdk
 
 Gst.init(None)
 
-SETTINGS_FILE = Path(__file__).resolve().parent / "ground_station_settings.json"
+APP_NAME = "prince_ground_station"
+
+
+def get_settings_file() -> Path:
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        config_dir = Path(xdg_config_home) / APP_NAME
+    else:
+        config_dir = Path.home() / ".config" / APP_NAME
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir / "ground_station_settings.json"
+
+
+SETTINGS_FILE = get_settings_file()
 
 
 def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
@@ -440,7 +455,7 @@ class UdpSerialBridge:
         self.fail_reason = ""
 
         self.info(
-            f"Opening serial: {self.serial_dev} @ {self.baudrate} (8N1, no flow control)"
+            f"Відкриваю serial: {self.serial_dev} @ {self.baudrate} (8N1, без flow control)"
         )
         self.ser = serial.Serial(
             port=self.serial_dev,
@@ -455,7 +470,7 @@ class UdpSerialBridge:
         )
 
         self.info(
-            f"Opening UDP: local {self.local_bind_ip}:{self.local_bind_port} -> "
+            f"Відкриваю UDP: local {self.local_bind_ip}:{self.local_bind_port} -> "
             f"remote {self.remote_host}:{self.remote_port}"
         )
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -488,7 +503,7 @@ class UdpSerialBridge:
         self.t_serial_to_udp.start()
 
         self.info(
-            "Bridge started: "
+            "Міст запущено: "
             f"local {self.actual_local_addr} <-> remote {self.remote_host}:{self.remote_port} "
             f"<-> serial {self.serial_dev} @ {self.baudrate}"
         )
@@ -543,7 +558,7 @@ class UdpSerialBridge:
         while self.running:
             try:
                 if self.sock is None or self.ser is None:
-                    self.mark_failed("udp_to_serial: socket or serial is None")
+                    self.mark_failed("udp_to_serial: socket або serial = None")
                     break
 
                 data = self.sock.recv(4096)
@@ -575,7 +590,7 @@ class UdpSerialBridge:
         while self.running:
             try:
                 if self.sock is None or self.ser is None:
-                    self.mark_failed("serial_to_udp: socket or serial is None")
+                    self.mark_failed("serial_to_udp: socket або serial = None")
                     break
 
                 data = self.ser.read(4096)
@@ -604,13 +619,13 @@ class UdpSerialBridge:
     def stats_text(self) -> str:
         status = "OK"
         if self.failed:
-            status = f"FAILED: {self.fail_reason}"
+            status = f"ПОМИЛКА: {self.fail_reason}"
 
         return (
             f"local={self.actual_local_addr} remote={self.remote_host}:{self.remote_port} "
             f"| U->S: {self.packets_udp_to_serial} pkt / {self.bytes_udp_to_serial} B "
             f"| S->U: {self.packets_serial_to_udp} pkt / {self.bytes_serial_to_udp} B "
-            f"| bridge: {status}"
+            f"| міст: {status}"
         )
 
 
@@ -678,7 +693,7 @@ class UdpVideoWindow:
 
         self.load_settings()
 
-        self.window = Gtk.Window(title="UDP Video Viewer + MikroTik SFP Monitor")
+        self.window = Gtk.Window(title="Наземна станція")
         self.window.set_default_size(1100, 700)
         self.window.set_keep_above(self.always_on_top)
         self.window.connect("destroy", self.on_destroy)
@@ -701,7 +716,7 @@ class UdpVideoWindow:
         btn_settings.connect("clicked", self.open_ground_station_settings)
         self.top_bar.pack_start(btn_settings, False, False, 0)
 
-        self.info_label = Gtk.Label(label="Video init...")
+        self.info_label = Gtk.Label(label="Ініціалізація відео...")
         self.info_label.set_xalign(0.0)
         self.info_label.set_line_wrap(True)
         root.pack_start(self.info_label, False, False, 0)
@@ -721,7 +736,7 @@ class UdpVideoWindow:
         self.video_sink = None
         self.bus = None
 
-        self.build_and_start_pipeline("Connecting to MikroTik SSH...")
+        self.build_and_start_pipeline("Підключення до MikroTik SSH...")
 
         self.bridge: Optional[UdpSerialBridge] = None
 
@@ -775,6 +790,7 @@ class UdpVideoWindow:
 
     def load_settings(self):
         self.set_default_settings()
+        print(f"[INFO] Шлях до налаштувань: {SETTINGS_FILE}", flush=True)
 
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -821,14 +837,16 @@ class UdpVideoWindow:
             self.mikrotik_password = str(mikrotik.get("password", self.mikrotik_password))
             self.mikrotik_interface = str(mikrotik.get("interface", self.mikrotik_interface))
 
-            print(f"[INFO] Ground station settings loaded from {SETTINGS_FILE}", flush=True)
+            print(f"[INFO] Налаштування завантажено з {SETTINGS_FILE}", flush=True)
 
         except FileNotFoundError:
-            print("[INFO] Settings file not found, using defaults", flush=True)
+            print("[INFO] Файл налаштувань не знайдено, використовую значення за замовчуванням", flush=True)
         except Exception as e:
-            print(f"[WARN] Failed to load settings: {e}", file=sys.stderr)
+            print(f"[WARN] Не вдалося завантажити налаштування: {e}", file=sys.stderr)
 
     def save_settings(self):
+        print(f"[INFO] Шлях до налаштувань: {SETTINGS_FILE}", flush=True)
+
         data = {
             "osd": {
                 "xpad": self.overlay_xpad,
@@ -867,9 +885,9 @@ class UdpVideoWindow:
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            print(f"[INFO] Ground station settings saved to {SETTINGS_FILE}", flush=True)
+            print(f"[INFO] Налаштування збережено у {SETTINGS_FILE}", flush=True)
         except Exception as e:
-            print(f"[ERROR] Failed to save settings: {e}", file=sys.stderr)
+            print(f"[ERROR] Не вдалося зберегти налаштування: {e}", file=sys.stderr)
 
     def build_pipeline(self, port: int, mode: str, text: str) -> str:
         safe_text = self.escape_gst_text(text)
@@ -1002,16 +1020,16 @@ class UdpVideoWindow:
         mt_if = self.mikrotik_interface or "N/A"
 
         lines = [
-            f"Video: {self.mode} UDP:{self.port} | MikroTik SSH: {mt_host}:{self.ssh_port} | IF: {mt_if} | Poll: {self.poll_interval:.1f}s"
+            f"Відео: {self.mode} UDP:{self.port} | MikroTik SSH: {mt_host}:{self.ssh_port} | Інтерфейс: {mt_if} | Опитування: {self.poll_interval:.1f}с"
         ]
 
         if self.bridge is not None:
             lines.append(self.bridge.stats_text())
         elif self.bridge_remote_host:
             if self.auto_controller_enabled:
-                lines.append("Controller bridge: waiting for Raspberry Pi Pico...")
+                lines.append("Міст керування: очікування Raspberry Pi Pico...")
             else:
-                lines.append(f"Controller bridge: configured serial {self.serial_dev}, not running")
+                lines.append(f"Міст керування: налаштований serial {self.serial_dev}, не запущений")
 
         return "\n".join(lines)
 
@@ -1054,7 +1072,7 @@ class UdpVideoWindow:
         pipeline_str = self.build_pipeline(
             self.port,
             self.mode,
-            old_text or "Connecting to MikroTik SSH...",
+            old_text or "Підключення до MikroTik SSH...",
         )
         print("Restart pipeline:")
         print(pipeline_str)
@@ -1149,7 +1167,7 @@ class UdpVideoWindow:
         dialog.set_default_size(760, 640)
         dialog.set_resizable(True)
 
-        dialog.add_button("Reset", 1)
+        dialog.add_button("Скинути", 1)
         dialog.add_button("Скасувати", Gtk.ResponseType.CANCEL)
         dialog.add_button("Застосувати", Gtk.ResponseType.OK)
 
@@ -1186,23 +1204,23 @@ class UdpVideoWindow:
         spin_font.set_range(6, 72)
         spin_font.set_increments(1, 2)
         spin_font.set_value(self.overlay_font_size)
-        self.add_labeled_row(grid_style, 0, "Font size:", spin_font)
+        self.add_labeled_row(grid_style, 0, "Розмір шрифту:", spin_font)
 
-        chk_bg = Gtk.CheckButton(label="Background")
+        chk_bg = Gtk.CheckButton(label="Фон")
         chk_bg.set_active(self.overlay_background)
         grid_style.attach(chk_bg, 0, 1, 2, 1)
 
         combo_halign = Gtk.ComboBoxText()
-        combo_halign.append("left", "Left")
-        combo_halign.append("right", "Right")
+        combo_halign.append("left", "Ліворуч")
+        combo_halign.append("right", "Праворуч")
         combo_halign.set_active_id(self.overlay_halign)
-        self.add_labeled_row(grid_style, 2, "Horizontal:", combo_halign)
+        self.add_labeled_row(grid_style, 2, "Горизонтально:", combo_halign)
 
         combo_valign = Gtk.ComboBoxText()
-        combo_valign.append("top", "Top")
-        combo_valign.append("bottom", "Bottom")
+        combo_valign.append("top", "Вгорі")
+        combo_valign.append("bottom", "Внизу")
         combo_valign.set_active_id(self.overlay_valign)
-        self.add_labeled_row(grid_style, 3, "Vertical:", combo_valign)
+        self.add_labeled_row(grid_style, 3, "Вертикально:", combo_valign)
 
         frame_show, grid_show = self.make_section("Що показувати")
         chk_show_loss = Gtk.CheckButton(label="Показувати затухання")
@@ -1229,32 +1247,32 @@ class UdpVideoWindow:
         frame_serial, grid_serial = self.make_section("Serial")
         entry_serial_dev = Gtk.Entry()
         entry_serial_dev.set_text(self.serial_dev or "")
-        self.add_labeled_row(grid_serial, 0, "Serial device:", entry_serial_dev)
+        self.add_labeled_row(grid_serial, 0, "Serial-пристрій:", entry_serial_dev)
 
         spin_serial_baud = Gtk.SpinButton()
         spin_serial_baud.set_range(1200, 5000000)
         spin_serial_baud.set_increments(100, 1000)
         spin_serial_baud.set_value(self.serial_baudrate)
-        self.add_labeled_row(grid_serial, 1, "Baudrate:", spin_serial_baud)
+        self.add_labeled_row(grid_serial, 1, "Швидкість baud:", spin_serial_baud)
 
         frame_udp, grid_udp = self.make_section("UDP")
         entry_remote_host = Gtk.Entry()
         entry_remote_host.set_text(self.bridge_remote_host)
-        self.add_labeled_row(grid_udp, 0, "Remote host:", entry_remote_host)
+        self.add_labeled_row(grid_udp, 0, "Віддалений host:", entry_remote_host)
 
         spin_remote_port = Gtk.SpinButton()
         spin_remote_port.set_range(0, 65535)
         spin_remote_port.set_value(self.bridge_remote_port)
-        self.add_labeled_row(grid_udp, 1, "Remote port:", spin_remote_port)
+        self.add_labeled_row(grid_udp, 1, "Віддалений порт:", spin_remote_port)
 
         entry_local_bind_ip = Gtk.Entry()
         entry_local_bind_ip.set_text(self.bridge_local_bind_ip)
-        self.add_labeled_row(grid_udp, 2, "Local bind IP:", entry_local_bind_ip)
+        self.add_labeled_row(grid_udp, 2, "Локальний bind IP:", entry_local_bind_ip)
 
         spin_local_bind_port = Gtk.SpinButton()
         spin_local_bind_port.set_range(0, 65535)
         spin_local_bind_port.set_value(self.bridge_local_bind_port)
-        self.add_labeled_row(grid_udp, 3, "Local bind port:", spin_local_bind_port)
+        self.add_labeled_row(grid_udp, 3, "Локальний bind порт:", spin_local_bind_port)
 
         frame_logs, grid_logs = self.make_section("Логи")
         chk_bridge_verbose = Gtk.CheckButton(label="Показувати логи bridge")
@@ -1278,16 +1296,16 @@ class UdpVideoWindow:
         spin_video_port = Gtk.SpinButton()
         spin_video_port.set_range(1, 65535)
         spin_video_port.set_value(self.port)
-        self.add_labeled_row(grid_video_main, 0, "UDP port:", spin_video_port)
+        self.add_labeled_row(grid_video_main, 0, "UDP-порт:", spin_video_port)
 
         combo_video_mode = Gtk.ComboBoxText()
         combo_video_mode.append("raw", "raw")
         combo_video_mode.append("rtp", "rtp")
         combo_video_mode.set_active_id(self.mode)
-        self.add_labeled_row(grid_video_main, 1, "Mode:", combo_video_mode)
+        self.add_labeled_row(grid_video_main, 1, "Режим:", combo_video_mode)
 
         frame_window_behavior, grid_window_behavior = self.make_section("Поведінка вікна")
-        chk_always_on_top = Gtk.CheckButton(label="always-on-top")
+        chk_always_on_top = Gtk.CheckButton(label="Завжди поверх інших вікон")
         chk_always_on_top.set_active(self.always_on_top)
         grid_window_behavior.attach(chk_always_on_top, 0, 0, 2, 1)
 
@@ -1302,21 +1320,21 @@ class UdpVideoWindow:
         frame_mt_conn, grid_mt_conn = self.make_section("Підключення")
         entry_mt_host = Gtk.Entry()
         entry_mt_host.set_text(self.mikrotik_host or "")
-        self.add_labeled_row(grid_mt_conn, 0, "MikroTik host:", entry_mt_host)
+        self.add_labeled_row(grid_mt_conn, 0, "Адреса MikroTik:", entry_mt_host)
 
         entry_mt_user = Gtk.Entry()
         entry_mt_user.set_text(self.mikrotik_user)
-        self.add_labeled_row(grid_mt_conn, 1, "MikroTik user:", entry_mt_user)
+        self.add_labeled_row(grid_mt_conn, 1, "Користувач MikroTik:", entry_mt_user)
 
         entry_mt_password = Gtk.Entry()
         entry_mt_password.set_visibility(False)
         entry_mt_password.set_text(self.mikrotik_password)
-        self.add_labeled_row(grid_mt_conn, 2, "MikroTik password:", entry_mt_password)
+        self.add_labeled_row(grid_mt_conn, 2, "Пароль MikroTik:", entry_mt_password)
 
         frame_mt_if, grid_mt_if = self.make_section("Інтерфейс")
         entry_mt_if = Gtk.Entry()
         entry_mt_if.set_text(self.mikrotik_interface or "")
-        self.add_labeled_row(grid_mt_if, 0, "SFP interface:", entry_mt_if)
+        self.add_labeled_row(grid_mt_if, 0, "SFP-інтерфейс:", entry_mt_if)
 
         mt_page.pack_start(frame_mt_conn, False, False, 0)
         mt_page.pack_start(frame_mt_if, False, False, 0)
@@ -1435,9 +1453,9 @@ class UdpVideoWindow:
             )
             self.bridge.start()
             self.serial_dev = serial_dev_to_use
-            print(f"[INFO] Controller connected: {serial_dev_to_use}", flush=True)
+            print(f"[INFO] Контролер підключено: {serial_dev_to_use}", flush=True)
         except Exception as e:
-            print(f"[WARN] Bridge start failed for {serial_dev_to_use}: {e}", file=sys.stderr)
+            print(f"[WARN] Не вдалося запустити міст для {serial_dev_to_use}: {e}", file=sys.stderr)
             self.bridge = None
             if self.auto_controller_enabled:
                 self.serial_dev = None
@@ -1451,9 +1469,9 @@ class UdpVideoWindow:
 
                 if found != last_seen:
                     if found:
-                        print(f"[INFO] Controller detected: {found}", flush=True)
+                        print(f"[INFO] Контролер знайдено: {found}", flush=True)
                     else:
-                        print("[INFO] Controller disconnected", flush=True)
+                        print("[INFO] Контролер відключено", flush=True)
                     last_seen = found
 
                 if self.auto_controller_enabled:
@@ -1463,7 +1481,7 @@ class UdpVideoWindow:
                             self.ensure_bridge_running()
                     else:
                         if self.bridge is not None:
-                            print("[INFO] Stopping bridge because controller disappeared", flush=True)
+                            print("[INFO] Зупиняю міст, бо контролер зник", flush=True)
                             try:
                                 self.bridge.stop()
                             except Exception:
@@ -1495,7 +1513,7 @@ class UdpVideoWindow:
         lines = []
 
         if error_text:
-            lines.append(f"STATUS: {error_text}")
+            lines.append(f"СТАТУС: {error_text}")
             return "\n".join(lines)
 
         rx_val = parse_dbm_value(rx_power)
@@ -1520,7 +1538,7 @@ class UdpVideoWindow:
 
     def ensure_mikrotik_ready(self) -> bool:
         if not self.mikrotik_host:
-            self.set_overlay_text("STATUS: Searching MikroTik via SSH...")
+            self.set_overlay_text("СТАТУС: Пошук MikroTik через SSH...")
             found = auto_discover_mikrotik(
                 username=self.mikrotik_user,
                 password=self.mikrotik_password,
@@ -1528,8 +1546,8 @@ class UdpVideoWindow:
             )
             if not found:
                 self.set_overlay_text(
-                    "STATUS: MikroTik not found by SSH scan\n"
-                    "Check IP connectivity or set --mikrotik-host"
+                    "СТАТУС: MikroTik не знайдено через SSH\n"
+                    "Перевірте IP-підключення або задайте --mikrotik-host"
                 )
                 self.set_info_text(self.build_info_text())
                 return False
@@ -1546,11 +1564,11 @@ class UdpVideoWindow:
         self.identity_name = self.mt_client.get_identity() or ""
 
         if not self.mikrotik_interface:
-            self.set_overlay_text("STATUS: Searching SFP interface...")
+            self.set_overlay_text("СТАТУС: Пошук SFP-інтерфейсу...")
             found_if = self.mt_client.auto_discover_sfp_interface()
             if not found_if:
                 self.set_overlay_text(
-                    f"HOST: {self.mikrotik_host}:{self.ssh_port}\nSTATUS: SFP interface not found"
+                    f"HOST: {self.mikrotik_host}:{self.ssh_port}\nСТАТУС: SFP-інтерфейс не знайдено"
                 )
                 self.set_info_text(self.build_info_text())
                 return False
@@ -1600,7 +1618,7 @@ class UdpVideoWindow:
                 time.sleep(self.poll_interval)
 
         except Exception as e:
-            self.set_overlay_text(f"STATUS: INIT ERROR: {type(e).__name__}")
+            self.set_overlay_text(f"СТАТУС: ПОМИЛКА ІНІЦІАЛІЗАЦІЇ: {type(e).__name__}")
             print(f"Init error: {e}", file=sys.stderr)
 
     def bridge_info_loop(self):
@@ -1647,9 +1665,9 @@ class UdpVideoWindow:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="UDP H.264 viewer with MikroTik SSH auto-discovery and optional UDP<->Serial bridge"
+        description="Переглядач UDP H.264 з автопошуком MikroTik по SSH та опційним UDP<->Serial мостом"
     )
-    parser.add_argument("--port", type=int, default=5600, help="UDP порт відео")
+    parser.add_argument("--port", type=int, default=5600, help="UDP-порт відео")
     parser.add_argument(
         "--mode",
         choices=["raw", "rtp"],
@@ -1665,7 +1683,7 @@ def main():
     parser.add_argument(
         "--mikrotik-host",
         default="192.168.121.1",
-        help="IP MikroTik. Можна не вказувати — буде автопошук по SSH",
+        help="IP-адреса MikroTik. Якщо не вказано — буде автопошук по SSH",
     )
     parser.add_argument(
         "--mikrotik-user",
@@ -1680,7 +1698,7 @@ def main():
     parser.add_argument(
         "--mikrotik-interface",
         default="sfp1",
-        help="Можна не вказувати — буде автопошук SFP інтерфейсу",
+        help="SFP-інтерфейс. Якщо не вказано — буде автопошук",
     )
     parser.add_argument(
         "--poll-interval",
@@ -1692,7 +1710,7 @@ def main():
         "--ssh-port",
         type=int,
         default=22,
-        help="Порт SSH MikroTik, зазвичай 22",
+        help="Порт SSH MikroTik",
     )
 
     parser.add_argument(
@@ -1704,18 +1722,18 @@ def main():
         "--serial-baudrate",
         type=int,
         default=420000,
-        help="Baudrate для bridge",
+        help="Швидкість baud для bridge",
     )
     parser.add_argument(
         "--bridge-remote-host",
         default="192.168.121.50",
-        help="Віддалена UDP IP-адреса для bridge, наприклад 192.168.121.50",
+        help="Віддалена UDP IP-адреса для bridge",
     )
     parser.add_argument(
         "--bridge-remote-port",
         type=int,
         default=9000,
-        help="Віддалений UDP порт для bridge",
+        help="Віддалений UDP-порт для bridge",
     )
     parser.add_argument(
         "--bridge-local-bind-ip",

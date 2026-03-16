@@ -47,6 +47,7 @@ def get_user_data_dir() -> Path:
 
 SETTINGS_DIR = get_user_config_dir()
 SETTINGS_FILE = SETTINGS_DIR / "ground_station_settings.json"
+PLACEHOLDER_IMAGE_FILE = Path(__file__).resolve().parent / "80dshv.png"
 
 
 def ensure_parent_dir(path: Path):
@@ -343,12 +344,7 @@ class MikroTikSshClient:
         return rx_power, tx_power, temperature, voltage, wavelength, distance
 
 
-def try_mikrotik_ssh(
-    host: str,
-    username: str,
-    password: str,
-    port: int,
-) -> bool:
+def try_mikrotik_ssh(host: str, username: str, password: str, port: int) -> bool:
     client = None
     try:
         client = MikroTikSshClient(host=host, username=username, password=password, port=port)
@@ -694,6 +690,11 @@ class UdpVideoWindow:
         self.mt_lock = threading.Lock()
         self.mikrotik_reconnect_requested = False
 
+        self.last_video_frame_time = 0.0
+        self.video_signal_timeout_sec = 1.5
+        self.placeholder_visible = True
+        self.monitor_sink = None
+
         self.load_settings()
 
         self.window = Gtk.Window(title=APP_NAME)
@@ -727,11 +728,32 @@ class UdpVideoWindow:
         self.frame_video.set_shadow_type(Gtk.ShadowType.IN)
         root.pack_start(self.frame_video, True, True, 0)
 
+        self.video_overlay = Gtk.Overlay()
+        self.frame_video.add(self.video_overlay)
+
         self.video_event_box = VideoEventBox(self)
-        self.frame_video.add(self.video_event_box)
+        self.video_overlay.add(self.video_event_box)
 
         self.video_box = Gtk.Box()
         self.video_event_box.add(self.video_box)
+
+        self.placeholder_box = Gtk.Box()
+        self.placeholder_box.set_halign(Gtk.Align.FILL)
+        self.placeholder_box.set_valign(Gtk.Align.FILL)
+
+        if PLACEHOLDER_IMAGE_FILE.exists():
+            self.placeholder_image = Gtk.Image.new_from_file(str(PLACEHOLDER_IMAGE_FILE))
+            self.placeholder_image.set_halign(Gtk.Align.CENTER)
+            self.placeholder_image.set_valign(Gtk.Align.CENTER)
+            self.placeholder_box.pack_start(self.placeholder_image, True, True, 0)
+        else:
+            self.placeholder_label = Gtk.Label(label="Немає сигналу")
+            self.placeholder_label.set_halign(Gtk.Align.CENTER)
+            self.placeholder_label.set_valign(Gtk.Align.CENTER)
+            self.placeholder_box.pack_start(self.placeholder_label, True, True, 0)
+
+        self.video_overlay.add_overlay(self.placeholder_box)
+        self.placeholder_box.show_all()
 
         self.pipeline = None
         self.overlay = None
@@ -739,6 +761,8 @@ class UdpVideoWindow:
         self.bus = None
 
         self.build_and_start_pipeline("STATUS: Підключення до MikroTik...")
+        self.set_placeholder_visible(True)
+        self.last_video_frame_time = 0.0
 
         self.bridge: Optional[UdpSerialBridge] = None
 
@@ -755,6 +779,9 @@ class UdpVideoWindow:
 
         self.controller_watch_thread = threading.Thread(target=self.controller_watch_loop, daemon=True)
         self.controller_watch_thread.start()
+
+        self.video_signal_thread = threading.Thread(target=self.video_signal_loop, daemon=True)
+        self.video_signal_thread.start()
 
     def set_default_settings(self):
         self.overlay_xpad = 0
@@ -907,7 +934,15 @@ class UdpVideoWindow:
                     xpad={self.overlay_xpad}
                     ypad={self.overlay_ypad}
                     font-desc="Sans Bold {self.overlay_font_size}"
-                ! gtksink name=videosink sync=false
+                ! tee name=t
+
+                t. ! queue
+                   ! gtksink name=videosink sync=false
+
+                t. ! queue leaky=downstream max-size-buffers=1
+                   ! videoconvert
+                   ! video/x-raw,format=RGB
+                   ! appsink name=monitorsink emit-signals=true max-buffers=1 drop=true sync=false
             """
 
         if mode == "rtp":
@@ -928,7 +963,15 @@ class UdpVideoWindow:
                     xpad={self.overlay_xpad}
                     ypad={self.overlay_ypad}
                     font-desc="Sans Bold {self.overlay_font_size}"
-                ! gtksink name=videosink sync=false
+                ! tee name=t
+
+                t. ! queue
+                   ! gtksink name=videosink sync=false
+
+                t. ! queue leaky=downstream max-size-buffers=1
+                   ! videoconvert
+                   ! video/x-raw,format=RGB
+                   ! appsink name=monitorsink emit-signals=true max-buffers=1 drop=true sync=false
             """
 
         raise ValueError("Невідомий режим. Використовуйте raw або rtp.")
@@ -941,11 +984,16 @@ class UdpVideoWindow:
         self.pipeline = Gst.parse_launch(pipeline_str)
         self.overlay = self.pipeline.get_by_name("overlay")
         self.video_sink = self.pipeline.get_by_name("videosink")
+        self.monitor_sink = self.pipeline.get_by_name("monitorsink")
 
         if self.overlay is None:
             raise RuntimeError("Не вдалося знайти textoverlay")
         if self.video_sink is None:
             raise RuntimeError("Не вдалося знайти gtksink")
+        if self.monitor_sink is None:
+            raise RuntimeError("Не вдалося знайти monitorsink")
+
+        self.monitor_sink.connect("new-sample", self.on_monitor_new_sample)
 
         video_widget = self.video_sink.props.widget
         self.video_box.pack_start(video_widget, True, True, 0)
@@ -959,6 +1007,41 @@ class UdpVideoWindow:
     @staticmethod
     def escape_gst_text(text: str) -> str:
         return text.replace("\\", "\\\\").replace('"', '\\"')
+
+    def on_monitor_new_sample(self, sink):
+        self.last_video_frame_time = time.time()
+        if self.placeholder_visible:
+            GLib.idle_add(self.set_placeholder_visible, False)
+        return Gst.FlowReturn.OK
+
+    def set_placeholder_visible(self, visible: bool):
+        self.placeholder_visible = visible
+        if visible:
+            self.placeholder_box.show()
+        else:
+            self.placeholder_box.hide()
+        return False
+
+    def video_signal_loop(self):
+        while self.running:
+            try:
+                now = time.time()
+                has_signal = (
+                    self.last_video_frame_time > 0
+                    and (now - self.last_video_frame_time) <= self.video_signal_timeout_sec
+                )
+
+                if has_signal:
+                    if self.placeholder_visible:
+                        GLib.idle_add(self.set_placeholder_visible, False)
+                else:
+                    if not self.placeholder_visible:
+                        GLib.idle_add(self.set_placeholder_visible, True)
+
+            except Exception as e:
+                print(f"[WARN] video_signal_loop: {e}", file=sys.stderr)
+
+            time.sleep(0.2)
 
     def on_fullscreen_button_clicked(self, widget):
         self.toggle_fullscreen_video()
@@ -1027,10 +1110,14 @@ class UdpVideoWindow:
         self.pipeline = None
         self.overlay = None
         self.video_sink = None
+        self.monitor_sink = None
         self.bus = None
 
         for child in self.video_box.get_children():
             self.video_box.remove(child)
+
+        self.last_video_frame_time = 0.0
+        self.set_placeholder_visible(True)
 
         self.build_and_start_pipeline(old_text or "STATUS: Підключення до MikroTik...")
         self.window.show_all()

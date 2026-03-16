@@ -1,1 +1,3 @@
-requirements.txt
+paramiko
+pyserial
+pyinstaller

@@ -5,7 +5,9 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -20,26 +22,35 @@ from serial.tools import list_ports
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gst", "1.0")
-
 from gi.repository import Gtk, Gst, GLib, Gdk
 
 Gst.init(None)
 
-APP_NAME = "prince_ground_station"
+APP_VERSION = "0.1 beta"
+APP_NAME = "Наземна станція для Князь Вандам Галацький"
+APP_ID = "knyaz-vandam-ground-station"
 
 
-def get_settings_file() -> Path:
+def get_user_config_dir() -> Path:
     xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
     if xdg_config_home:
-        config_dir = Path(xdg_config_home) / APP_NAME
-    else:
-        config_dir = Path.home() / ".config" / APP_NAME
-
-    config_dir.mkdir(parents=True, exist_ok=True)
-    return config_dir / "ground_station_settings.json"
+        return Path(xdg_config_home) / APP_ID
+    return Path.home() / ".config" / APP_ID
 
 
-SETTINGS_FILE = get_settings_file()
+def get_user_data_dir() -> Path:
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        return Path(xdg_data_home) / APP_ID
+    return Path.home() / ".local" / "share" / APP_ID
+
+
+SETTINGS_DIR = get_user_config_dir()
+SETTINGS_FILE = SETTINGS_DIR / "ground_station_settings.json"
+
+
+def ensure_parent_dir(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
@@ -178,6 +189,20 @@ def infer_distance_from_text(text: str) -> Optional[str]:
         return f"{match.group(1)}km"
 
     return None
+
+
+def list_serial_devices() -> List[Tuple[str, str]]:
+    items = []
+    for p in list_ports.comports():
+        parts = [p.device]
+        if p.description:
+            parts.append(p.description)
+        if p.manufacturer:
+            parts.append(p.manufacturer)
+        text = " | ".join(parts)
+        items.append((p.device, text))
+    items.sort(key=lambda x: x[0])
+    return items
 
 
 def find_controller_serial_device() -> Optional[str]:
@@ -326,12 +351,7 @@ def try_mikrotik_ssh(
 ) -> bool:
     client = None
     try:
-        client = MikroTikSshClient(
-            host=host,
-            username=username,
-            password=password,
-            port=port,
-        )
+        client = MikroTikSshClient(host=host, username=username, password=password, port=port)
         client.connect()
         identity = client.get_identity()
         return bool(identity)
@@ -342,11 +362,7 @@ def try_mikrotik_ssh(
             client.disconnect()
 
 
-def auto_discover_mikrotik(
-    username: str,
-    password: str,
-    port: int,
-) -> Optional[str]:
+def auto_discover_mikrotik(username: str, password: str, port: int) -> Optional[str]:
     networks = get_local_ipv4_networks()
     print("Локальні мережі для сканування:", [str(n) for n in networks])
 
@@ -454,9 +470,7 @@ class UdpSerialBridge:
         self.failed = False
         self.fail_reason = ""
 
-        self.info(
-            f"Відкриваю serial: {self.serial_dev} @ {self.baudrate} (8N1, без flow control)"
-        )
+        self.info(f"Opening serial: {self.serial_dev} @ {self.baudrate} (8N1, no flow control)")
         self.ser = serial.Serial(
             port=self.serial_dev,
             baudrate=self.baudrate,
@@ -470,7 +484,7 @@ class UdpSerialBridge:
         )
 
         self.info(
-            f"Відкриваю UDP: local {self.local_bind_ip}:{self.local_bind_port} -> "
+            f"Opening UDP: local {self.local_bind_ip}:{self.local_bind_port} -> "
             f"remote {self.remote_host}:{self.remote_port}"
         )
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -488,22 +502,14 @@ class UdpSerialBridge:
 
         self.running = True
 
-        self.t_udp_to_serial = threading.Thread(
-            target=self.udp_to_serial_loop,
-            daemon=True,
-            name="udp_to_serial",
-        )
-        self.t_serial_to_udp = threading.Thread(
-            target=self.serial_to_udp_loop,
-            daemon=True,
-            name="serial_to_udp",
-        )
+        self.t_udp_to_serial = threading.Thread(target=self.udp_to_serial_loop, daemon=True, name="udp_to_serial")
+        self.t_serial_to_udp = threading.Thread(target=self.serial_to_udp_loop, daemon=True, name="serial_to_udp")
 
         self.t_udp_to_serial.start()
         self.t_serial_to_udp.start()
 
         self.info(
-            "Міст запущено: "
+            "Bridge started: "
             f"local {self.actual_local_addr} <-> remote {self.remote_host}:{self.remote_port} "
             f"<-> serial {self.serial_dev} @ {self.baudrate}"
         )
@@ -558,7 +564,7 @@ class UdpSerialBridge:
         while self.running:
             try:
                 if self.sock is None or self.ser is None:
-                    self.mark_failed("udp_to_serial: socket або serial = None")
+                    self.mark_failed("udp_to_serial: socket or serial is None")
                     break
 
                 data = self.sock.recv(4096)
@@ -571,9 +577,7 @@ class UdpSerialBridge:
                 self.last_udp_to_serial_time = time.time()
 
                 if self.hex_dump:
-                    self.log(
-                        f"UDP -> SERIAL | {len(data)} bytes | hex={self.short_hex(data)}"
-                    )
+                    self.log(f"UDP -> SERIAL | {len(data)} bytes | hex={self.short_hex(data)}")
                 else:
                     self.log(f"UDP -> SERIAL | {len(data)} bytes")
 
@@ -590,7 +594,7 @@ class UdpSerialBridge:
         while self.running:
             try:
                 if self.sock is None or self.ser is None:
-                    self.mark_failed("serial_to_udp: socket або serial = None")
+                    self.mark_failed("serial_to_udp: socket or serial is None")
                     break
 
                 data = self.ser.read(4096)
@@ -603,9 +607,7 @@ class UdpSerialBridge:
                 self.last_serial_to_udp_time = time.time()
 
                 if self.hex_dump:
-                    self.log(
-                        f"SERIAL -> UDP | {len(data)} bytes | hex={self.short_hex(data)}"
-                    )
+                    self.log(f"SERIAL -> UDP | {len(data)} bytes | hex={self.short_hex(data)}")
                 else:
                     self.log(f"SERIAL -> UDP | {len(data)} bytes")
 
@@ -619,13 +621,13 @@ class UdpSerialBridge:
     def stats_text(self) -> str:
         status = "OK"
         if self.failed:
-            status = f"ПОМИЛКА: {self.fail_reason}"
+            status = f"FAILED: {self.fail_reason}"
 
         return (
             f"local={self.actual_local_addr} remote={self.remote_host}:{self.remote_port} "
             f"| U->S: {self.packets_udp_to_serial} pkt / {self.bytes_udp_to_serial} B "
             f"| S->U: {self.packets_serial_to_udp} pkt / {self.bytes_serial_to_udp} B "
-            f"| міст: {status}"
+            f"| bridge: {status}"
         )
 
 
@@ -634,10 +636,7 @@ class VideoEventBox(Gtk.EventBox):
         super().__init__()
         self.owner = owner
         self.set_visible_window(False)
-        self.add_events(
-            Gdk.EventMask.BUTTON_PRESS_MASK
-            | Gdk.EventMask.BUTTON_RELEASE_MASK
-        )
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
         self.connect("button-press-event", self.on_button_press)
 
     def on_button_press(self, widget, event):
@@ -691,9 +690,13 @@ class UdpVideoWindow:
         self.auto_controller_enabled = not bool(self.serial_dev)
         self.is_video_fullscreen = False
 
+        self.mt_client: Optional[MikroTikSshClient] = None
+        self.mt_lock = threading.Lock()
+        self.mikrotik_reconnect_requested = False
+
         self.load_settings()
 
-        self.window = Gtk.Window(title="Наземна станція")
+        self.window = Gtk.Window(title=APP_NAME)
         self.window.set_default_size(1100, 700)
         self.window.set_keep_above(self.always_on_top)
         self.window.connect("destroy", self.on_destroy)
@@ -708,18 +711,17 @@ class UdpVideoWindow:
 
         self.top_bar.pack_start(Gtk.Label(label=""), True, True, 0)
 
-        self.btn_fullscreen = Gtk.Button(label="На весь екран")
+        self.btn_fullscreen = Gtk.Button()
+        self.btn_fullscreen.set_image(Gtk.Image.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.BUTTON))
+        self.btn_fullscreen.set_tooltip_text("На весь екран")
         self.btn_fullscreen.connect("clicked", self.on_fullscreen_button_clicked)
         self.top_bar.pack_start(self.btn_fullscreen, False, False, 0)
 
-        btn_settings = Gtk.Button(label="Налаштування...")
+        btn_settings = Gtk.Button()
+        btn_settings.set_image(Gtk.Image.new_from_icon_name("emblem-system-symbolic", Gtk.IconSize.BUTTON))
+        btn_settings.set_tooltip_text("Налаштування")
         btn_settings.connect("clicked", self.open_ground_station_settings)
         self.top_bar.pack_start(btn_settings, False, False, 0)
-
-        self.info_label = Gtk.Label(label="Ініціалізація відео...")
-        self.info_label.set_xalign(0.0)
-        self.info_label.set_line_wrap(True)
-        root.pack_start(self.info_label, False, False, 0)
 
         self.frame_video = Gtk.Frame()
         self.frame_video.set_shadow_type(Gtk.ShadowType.IN)
@@ -736,7 +738,7 @@ class UdpVideoWindow:
         self.video_sink = None
         self.bus = None
 
-        self.build_and_start_pipeline("Підключення до MikroTik SSH...")
+        self.build_and_start_pipeline("STATUS: Підключення до MikroTik...")
 
         self.bridge: Optional[UdpSerialBridge] = None
 
@@ -745,26 +747,22 @@ class UdpVideoWindow:
 
         self.window.show_all()
 
-        self.mt_client: Optional[MikroTikSshClient] = None
         self.poll_thread = threading.Thread(target=self.poll_mikrotik_loop, daemon=True)
         self.poll_thread.start()
 
         self.bridge_info_thread = threading.Thread(target=self.bridge_info_loop, daemon=True)
         self.bridge_info_thread.start()
 
-        self.controller_watch_thread = threading.Thread(
-            target=self.controller_watch_loop,
-            daemon=True,
-        )
+        self.controller_watch_thread = threading.Thread(target=self.controller_watch_loop, daemon=True)
         self.controller_watch_thread.start()
 
     def set_default_settings(self):
         self.overlay_xpad = 0
-        self.overlay_ypad = 400
+        self.overlay_ypad = 0
         self.overlay_font_size = 8
         self.overlay_background = False
         self.overlay_halign = "right"
-        self.overlay_valign = "top"
+        self.overlay_valign = "bottom"
 
         self.show_loss = True
         self.show_distance = True
@@ -790,9 +788,10 @@ class UdpVideoWindow:
 
     def load_settings(self):
         self.set_default_settings()
-        print(f"[INFO] Шлях до налаштувань: {SETTINGS_FILE}", flush=True)
 
         try:
+            SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
@@ -840,13 +839,11 @@ class UdpVideoWindow:
             print(f"[INFO] Налаштування завантажено з {SETTINGS_FILE}", flush=True)
 
         except FileNotFoundError:
-            print("[INFO] Файл налаштувань не знайдено, використовую значення за замовчуванням", flush=True)
+            print("[INFO] Файл налаштувань не знайдено, використовую дефолтні", flush=True)
         except Exception as e:
             print(f"[WARN] Не вдалося завантажити налаштування: {e}", file=sys.stderr)
 
     def save_settings(self):
-        print(f"[INFO] Шлях до налаштувань: {SETTINGS_FILE}", flush=True)
-
         data = {
             "osd": {
                 "xpad": self.overlay_xpad,
@@ -883,9 +880,10 @@ class UdpVideoWindow:
         }
 
         try:
+            SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            print(f"[INFO] Налаштування збережено у {SETTINGS_FILE}", flush=True)
+            print(f"[INFO] Налаштування збережено в {SETTINGS_FILE}", flush=True)
         except Exception as e:
             print(f"[ERROR] Не вдалося зберегти налаштування: {e}", file=sys.stderr)
 
@@ -962,11 +960,6 @@ class UdpVideoWindow:
     def escape_gst_text(text: str) -> str:
         return text.replace("\\", "\\\\").replace('"', '\\"')
 
-    def apply_osd_visibility_after_show_all(self):
-        if self.is_video_fullscreen:
-            self.top_bar.hide()
-            self.info_label.hide()
-
     def on_fullscreen_button_clicked(self, widget):
         self.toggle_fullscreen_video()
 
@@ -994,58 +987,28 @@ class UdpVideoWindow:
 
         if self.is_video_fullscreen:
             self.top_bar.hide()
-            self.info_label.hide()
             self.frame_video.set_shadow_type(Gtk.ShadowType.NONE)
             self.window.fullscreen()
-            self.btn_fullscreen.set_label("Вийти з повного екрана")
+            self.btn_fullscreen.set_image(
+                Gtk.Image.new_from_icon_name("view-restore-symbolic", Gtk.IconSize.BUTTON)
+            )
+            self.btn_fullscreen.set_tooltip_text("Вийти з повного екрана")
         else:
             self.window.unfullscreen()
             self.top_bar.show()
-            self.info_label.show()
             self.frame_video.set_shadow_type(Gtk.ShadowType.IN)
-            self.btn_fullscreen.set_label("На весь екран")
+            self.btn_fullscreen.set_image(
+                Gtk.Image.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.BUTTON)
+            )
+            self.btn_fullscreen.set_tooltip_text("На весь екран")
 
         self.window.show_all()
-        self.apply_osd_visibility_after_show_all()
+        if self.is_video_fullscreen:
+            self.top_bar.hide()
 
     def set_overlay_text(self, text: str):
         if self.overlay is not None:
             GLib.idle_add(self.overlay.set_property, "text", text)
-
-    def set_info_text(self, text: str):
-        GLib.idle_add(self.info_label.set_text, text)
-
-    def build_info_text(self) -> str:
-        mt_host = self.mikrotik_host or "N/A"
-        mt_if = self.mikrotik_interface or "N/A"
-
-        lines = [
-            f"Відео: {self.mode} UDP:{self.port} | MikroTik SSH: {mt_host}:{self.ssh_port} | Інтерфейс: {mt_if} | Опитування: {self.poll_interval:.1f}с"
-        ]
-
-        if self.bridge is not None:
-            lines.append(self.bridge.stats_text())
-        elif self.bridge_remote_host:
-            if self.auto_controller_enabled:
-                lines.append("Міст керування: очікування Raspberry Pi Pico...")
-            else:
-                lines.append(f"Міст керування: налаштований serial {self.serial_dev}, не запущений")
-
-        return "\n".join(lines)
-
-    def refresh_overlay_text_only(self):
-        try:
-            text = self.build_overlay_text(
-                rx_power=None,
-                tx_power=None,
-                temperature=None,
-                voltage=None,
-                wavelength=None,
-                distance=None,
-            )
-            self.set_overlay_text(text)
-        except Exception:
-            pass
 
     def restart_video_pipeline(self):
         old_text = ""
@@ -1069,34 +1032,10 @@ class UdpVideoWindow:
         for child in self.video_box.get_children():
             self.video_box.remove(child)
 
-        pipeline_str = self.build_pipeline(
-            self.port,
-            self.mode,
-            old_text or "Підключення до MikroTik SSH...",
-        )
-        print("Restart pipeline:")
-        print(pipeline_str)
-
-        self.pipeline = Gst.parse_launch(pipeline_str)
-        self.overlay = self.pipeline.get_by_name("overlay")
-        self.video_sink = self.pipeline.get_by_name("videosink")
-
-        if self.overlay is None:
-            raise RuntimeError("Не вдалося знайти textoverlay")
-        if self.video_sink is None:
-            raise RuntimeError("Не вдалося знайти gtksink")
-
-        video_widget = self.video_sink.props.widget
-        self.video_box.pack_start(video_widget, True, True, 0)
-        self.video_box.show_all()
-
-        self.bus = self.pipeline.get_bus()
-        self.bus.add_signal_watch()
-        self.bus.connect("message", self.on_bus_message)
-
-        self.pipeline.set_state(Gst.State.PLAYING)
+        self.build_and_start_pipeline(old_text or "STATUS: Підключення до MikroTik...")
         self.window.show_all()
-        self.apply_osd_visibility_after_show_all()
+        if self.is_video_fullscreen:
+            self.top_bar.hide()
 
     def restart_bridge(self):
         if self.bridge is not None:
@@ -1108,6 +1047,19 @@ class UdpVideoWindow:
 
         if self.bridge_remote_host:
             self.ensure_bridge_running()
+
+    def request_mikrotik_reconnect(self):
+        with self.mt_lock:
+            if self.mt_client is not None:
+                try:
+                    self.mt_client.disconnect()
+                except Exception:
+                    pass
+            self.mt_client = None
+            self.identity_name = ""
+            self.mikrotik_reconnect_requested = True
+
+        self.set_overlay_text("STATUS: Перепідключення до MikroTik...")
 
     def check_bridge_health(self):
         if not self.bridge_remote_host:
@@ -1135,6 +1087,338 @@ class UdpVideoWindow:
                 pass
             self.bridge = None
             self.ensure_bridge_running()
+
+    def build_overlay_text(
+        self,
+        rx_power: Optional[str],
+        tx_power: Optional[str],
+        temperature: Optional[str],
+        voltage: Optional[str],
+        wavelength: Optional[str],
+        distance: Optional[str],
+        error_text: Optional[str] = None,
+    ) -> str:
+        lines = []
+
+        if error_text:
+            lines.append(f"STATUS: {error_text}")
+            return "\n".join(lines)
+
+        rx_val = parse_dbm_value(rx_power)
+        tx_val = parse_dbm_value(tx_power)
+
+        if self.show_loss:
+            loss_text = "N/A"
+            if tx_val is not None and rx_val is not None:
+                loss_text = f"{(tx_val - rx_val):.2f} dB"
+            lines.append(f"LOSS: {loss_text}")
+
+        wl_dist = []
+        if self.show_wavelength and wavelength:
+            wl_dist.append(f"WL: {wavelength}")
+        if self.show_distance and distance:
+            wl_dist.append(f"DIST: {distance}")
+
+        if wl_dist:
+            lines.append(" | ".join(wl_dist))
+
+        return "\n".join(lines)
+
+    def ensure_mikrotik_ready(self) -> bool:
+        if not self.mikrotik_host:
+            self.set_overlay_text("STATUS: Пошук MikroTik через SSH...")
+            found = auto_discover_mikrotik(
+                username=self.mikrotik_user,
+                password=self.mikrotik_password,
+                port=self.ssh_port,
+            )
+            if not found:
+                self.set_overlay_text("STATUS: MikroTik не знайдено")
+                return False
+            self.mikrotik_host = found
+
+        client = MikroTikSshClient(
+            host=self.mikrotik_host,
+            username=self.mikrotik_user,
+            password=self.mikrotik_password,
+            port=self.ssh_port,
+        )
+
+        client.connect()
+        identity = client.get_identity() or ""
+
+        if not self.mikrotik_interface:
+            self.set_overlay_text("STATUS: Пошук SFP інтерфейсу...")
+            found_if = client.auto_discover_sfp_interface()
+            if not found_if:
+                client.disconnect()
+                self.set_overlay_text("STATUS: SFP інтерфейс не знайдено")
+                return False
+            self.mikrotik_interface = found_if
+
+        with self.mt_lock:
+            old_client = self.mt_client
+            self.mt_client = client
+            self.identity_name = identity
+            self.mikrotik_reconnect_requested = False
+
+        if old_client is not None and old_client is not client:
+            try:
+                old_client.disconnect()
+            except Exception:
+                pass
+
+        return True
+
+    def poll_mikrotik_loop(self):
+        while self.running:
+            try:
+                reconnect_needed = False
+                with self.mt_lock:
+                    reconnect_needed = self.mt_client is None or self.mikrotik_reconnect_requested
+
+                if reconnect_needed:
+                    if not self.ensure_mikrotik_ready():
+                        time.sleep(self.poll_interval)
+                        continue
+
+                with self.mt_lock:
+                    client = self.mt_client
+                    interface_name = self.mikrotik_interface
+
+                if client is None or not interface_name:
+                    self.set_overlay_text("STATUS: Немає підключення до MikroTik")
+                    time.sleep(self.poll_interval)
+                    continue
+
+                try:
+                    rx_power, tx_power, temperature, voltage, wavelength, distance = (
+                        client.fetch_sfp_status(interface_name)
+                    )
+                    text = self.build_overlay_text(
+                        rx_power=rx_power,
+                        tx_power=tx_power,
+                        temperature=temperature,
+                        voltage=voltage,
+                        wavelength=wavelength,
+                        distance=distance,
+                    )
+                except Exception as e:
+                    with self.mt_lock:
+                        try:
+                            if self.mt_client is not None:
+                                self.mt_client.disconnect()
+                        except Exception:
+                            pass
+                        self.mt_client = None
+                        self.mikrotik_reconnect_requested = True
+
+                    text = self.build_overlay_text(
+                        rx_power=None,
+                        tx_power=None,
+                        temperature=None,
+                        voltage=None,
+                        wavelength=None,
+                        distance=None,
+                        error_text=f"SSH ERROR: {type(e).__name__}",
+                    )
+
+                self.set_overlay_text(text)
+                time.sleep(self.poll_interval)
+
+            except Exception as e:
+                self.set_overlay_text(f"STATUS: INIT ERROR: {type(e).__name__}")
+                print(f"Init error: {e}", file=sys.stderr)
+                time.sleep(self.poll_interval)
+
+    def ensure_bridge_running(self):
+        if not self.bridge_remote_host:
+            return
+
+        if self.bridge is not None and self.bridge.is_alive():
+            return
+
+        if self.bridge is not None:
+            try:
+                self.bridge.stop()
+            except Exception:
+                pass
+            self.bridge = None
+
+        serial_dev_to_use = self.serial_dev
+
+        if not serial_dev_to_use and self.auto_controller_enabled:
+            serial_dev_to_use = find_controller_serial_device()
+
+        if not serial_dev_to_use:
+            return
+
+        try:
+            self.bridge = UdpSerialBridge(
+                remote_host=self.bridge_remote_host,
+                remote_port=self.bridge_remote_port,
+                serial_dev=serial_dev_to_use,
+                baudrate=self.serial_baudrate,
+                local_bind_ip=self.bridge_local_bind_ip,
+                local_bind_port=self.bridge_local_bind_port,
+                verbose=self.bridge_verbose,
+                hex_dump=self.bridge_hex,
+            )
+            self.bridge.start()
+            self.serial_dev = serial_dev_to_use
+            print(f"[INFO] Контролер підключено: {serial_dev_to_use}", flush=True)
+        except Exception as e:
+            print(f"[WARN] Не вдалося запустити bridge для {serial_dev_to_use}: {e}", file=sys.stderr)
+            self.bridge = None
+            if self.auto_controller_enabled:
+                self.serial_dev = None
+
+    def controller_watch_loop(self):
+        last_seen = None
+
+        while self.running:
+            try:
+                found = find_controller_serial_device() if self.auto_controller_enabled else self.serial_dev
+
+                if found != last_seen:
+                    if found:
+                        print(f"[INFO] Контролер знайдено: {found}", flush=True)
+                    else:
+                        print("[INFO] Контролер відключено", flush=True)
+                    last_seen = found
+
+                if self.auto_controller_enabled:
+                    if found:
+                        if self.bridge is None or not self.bridge.is_alive():
+                            self.serial_dev = found
+                            self.ensure_bridge_running()
+                    else:
+                        if self.bridge is not None:
+                            print("[INFO] Зупиняю bridge, бо контролер зник", flush=True)
+                            try:
+                                self.bridge.stop()
+                            except Exception:
+                                pass
+                            self.bridge = None
+                            self.serial_dev = None
+                else:
+                    if (self.bridge is None or not self.bridge.is_alive()) and self.serial_dev:
+                        self.ensure_bridge_running()
+
+            except Exception as e:
+                print(f"[WARN] controller_watch_loop: {e}", file=sys.stderr)
+
+            time.sleep(1.0)
+
+    def bridge_info_loop(self):
+        while self.running:
+            try:
+                self.check_bridge_health()
+            except Exception as e:
+                print(f"[WARN] bridge_info_loop: {e}", file=sys.stderr)
+            time.sleep(1.0)
+
+    def on_bus_message(self, bus, message):
+        msg_type = message.type
+
+        if msg_type == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print("GStreamer ERROR:", err, file=sys.stderr)
+            if debug:
+                print("DEBUG:", debug, file=sys.stderr)
+
+        elif msg_type == Gst.MessageType.WARNING:
+            warn, debug = message.parse_warning()
+            print("GStreamer WARNING:", warn, file=sys.stderr)
+            if debug:
+                print("DEBUG:", debug, file=sys.stderr)
+
+        elif msg_type == Gst.MessageType.EOS:
+            print("Кінець потоку")
+
+    def show_message(self, title: str, text: str, message_type=Gtk.MessageType.INFO):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            flags=0,
+            message_type=message_type,
+            buttons=Gtk.ButtonsType.OK,
+            text=title,
+        )
+        dialog.format_secondary_text(text)
+        dialog.run()
+        dialog.destroy()
+
+    def find_icon_source(self) -> Optional[Path]:
+        candidates = [
+            Path(__file__).resolve().parent / "prince.png",
+            Path(__file__).resolve().parent / "icon.png",
+            Path(__file__).resolve().parent / "app.png",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
+    def create_desktop_shortcut(self):
+        try:
+            data_dir = get_user_data_dir()
+            apps_dir = Path.home() / ".local" / "share" / "applications"
+            icons_dir = Path.home() / ".local" / "share" / "icons" / "hicolor" / "256x256" / "apps"
+            install_dir = Path.home() / ".local" / "opt" / APP_ID
+
+            data_dir.mkdir(parents=True, exist_ok=True)
+            apps_dir.mkdir(parents=True, exist_ok=True)
+            icons_dir.mkdir(parents=True, exist_ok=True)
+            install_dir.mkdir(parents=True, exist_ok=True)
+
+            appimage_path = os.environ.get("APPIMAGE")
+            if appimage_path:
+                src = Path(appimage_path)
+                target_exec = install_dir / f"{APP_ID}.AppImage"
+                shutil.copy2(src, target_exec)
+                target_exec.chmod(target_exec.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                exec_line = str(target_exec)
+            else:
+                src = Path(__file__).resolve()
+                exec_line = f'python3 "{src}"'
+
+            icon_name = APP_ID
+            icon_source = self.find_icon_source()
+            if icon_source is not None:
+                icon_target = icons_dir / f"{icon_name}{icon_source.suffix.lower()}"
+                shutil.copy2(icon_source, icon_target)
+
+            desktop_file = apps_dir / f"{APP_ID}.desktop"
+            desktop_content = f"""[Desktop Entry]
+Type=Application
+Name={APP_NAME}
+Comment={APP_NAME}
+Exec={exec_line}
+Icon={icon_name}
+Terminal=false
+Categories=Utility;Network;Video;
+StartupNotify=true
+"""
+            desktop_file.write_text(desktop_content, encoding="utf-8")
+            desktop_file.chmod(desktop_file.stat().st_mode | stat.S_IXUSR)
+
+            try:
+                subprocess.run(["update-desktop-database", str(apps_dir)], check=False)
+            except Exception:
+                pass
+
+            self.show_message(
+                "Ярлик створено",
+                f"Ярлик створено у:\n{desktop_file}",
+                Gtk.MessageType.INFO,
+            )
+
+        except Exception as e:
+            self.show_message(
+                "Помилка створення ярлика",
+                str(e),
+                Gtk.MessageType.ERROR,
+            )
 
     def make_section(self, title: str) -> Tuple[Gtk.Frame, Gtk.Grid]:
         frame = Gtk.Frame(label=title)
@@ -1164,16 +1448,15 @@ class UdpVideoWindow:
             transient_for=self.window,
             flags=0,
         )
-        dialog.set_default_size(760, 640)
+        dialog.set_default_size(780, 680)
         dialog.set_resizable(True)
 
+        dialog.add_button("Створити ярлик", 2)
         dialog.add_button("Скинути", 1)
         dialog.add_button("Скасувати", Gtk.ResponseType.CANCEL)
         dialog.add_button("Застосувати", Gtk.ResponseType.OK)
 
         content = dialog.get_content_area()
-        content.set_border_width(0)
-
         outer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         outer_box.set_border_width(12)
         content.add(outer_box)
@@ -1183,8 +1466,23 @@ class UdpVideoWindow:
         notebook.set_vexpand(True)
         outer_box.pack_start(notebook, True, True, 0)
 
+        # OSD
         osd_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         osd_page.set_border_width(8)
+
+        info_frame, info_grid = self.make_section("Пояснення")
+        info_label = Gtk.Label(
+            label=(
+                "OSD — це наекранне меню з даними, які беруться з MikroTik / SFP.\n"
+                "Для виводу:\n"
+                "• затухання\n"
+                "• максимальна дистанція, яку може обробити SFP\n"
+                "• довжина хвилі випромінювання"
+            )
+        )
+        info_label.set_xalign(0.0)
+        info_label.set_line_wrap(True)
+        info_grid.attach(info_label, 0, 0, 2, 1)
 
         frame_pos, grid_pos = self.make_section("Позиція")
         spin_x = Gtk.SpinButton()
@@ -1227,7 +1525,7 @@ class UdpVideoWindow:
         chk_show_loss.set_active(self.show_loss)
         grid_show.attach(chk_show_loss, 0, 0, 2, 1)
 
-        chk_show_distance = Gtk.CheckButton(label="Показувати дистанцію")
+        chk_show_distance = Gtk.CheckButton(label="Показувати максимальну дистанцію SFP")
         chk_show_distance.set_active(self.show_distance)
         grid_show.attach(chk_show_distance, 0, 1, 2, 1)
 
@@ -1235,25 +1533,41 @@ class UdpVideoWindow:
         chk_show_wavelength.set_active(self.show_wavelength)
         grid_show.attach(chk_show_wavelength, 0, 2, 2, 1)
 
+        osd_page.pack_start(info_frame, False, False, 0)
         osd_page.pack_start(frame_pos, False, False, 0)
         osd_page.pack_start(frame_style, False, False, 0)
         osd_page.pack_start(frame_show, False, False, 0)
         osd_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(osd_page, Gtk.Label(label="OSD"))
 
+        # Bridge
         bridge_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         bridge_page.set_border_width(8)
 
         frame_serial, grid_serial = self.make_section("Serial")
-        entry_serial_dev = Gtk.Entry()
-        entry_serial_dev.set_text(self.serial_dev or "")
-        self.add_labeled_row(grid_serial, 0, "Serial-пристрій:", entry_serial_dev)
+        combo_serial_dev = Gtk.ComboBoxText()
+        combo_serial_dev.append("__auto__", "Auto (автопошук Raspberry Pi Pico)")
+        current_serial_items = list_serial_devices()
+        selected_serial_id = "__auto__" if not self.serial_dev else self.serial_dev
+        found_selected = selected_serial_id == "__auto__"
+
+        for dev, text in current_serial_items:
+            combo_serial_dev.append(dev, text)
+            if dev == self.serial_dev:
+                found_selected = True
+
+        if self.serial_dev and not found_selected:
+            combo_serial_dev.append(self.serial_dev, f"{self.serial_dev} | (збережений пристрій)")
+            found_selected = True
+
+        combo_serial_dev.set_active_id(selected_serial_id if found_selected else "__auto__")
+        self.add_labeled_row(grid_serial, 0, "Пристрій:", combo_serial_dev)
 
         spin_serial_baud = Gtk.SpinButton()
         spin_serial_baud.set_range(1200, 5000000)
         spin_serial_baud.set_increments(100, 1000)
         spin_serial_baud.set_value(self.serial_baudrate)
-        self.add_labeled_row(grid_serial, 1, "Швидкість baud:", spin_serial_baud)
+        self.add_labeled_row(grid_serial, 1, "Baudrate:", spin_serial_baud)
 
         frame_udp, grid_udp = self.make_section("UDP")
         entry_remote_host = Gtk.Entry()
@@ -1289,6 +1603,7 @@ class UdpVideoWindow:
         bridge_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(bridge_page, Gtk.Label(label="Міст керування"))
 
+        # Video
         video_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         video_page.set_border_width(8)
 
@@ -1296,7 +1611,7 @@ class UdpVideoWindow:
         spin_video_port = Gtk.SpinButton()
         spin_video_port.set_range(1, 65535)
         spin_video_port.set_value(self.port)
-        self.add_labeled_row(grid_video_main, 0, "UDP-порт:", spin_video_port)
+        self.add_labeled_row(grid_video_main, 0, "UDP порт:", spin_video_port)
 
         combo_video_mode = Gtk.ComboBoxText()
         combo_video_mode.append("raw", "raw")
@@ -1305,7 +1620,7 @@ class UdpVideoWindow:
         self.add_labeled_row(grid_video_main, 1, "Режим:", combo_video_mode)
 
         frame_window_behavior, grid_window_behavior = self.make_section("Поведінка вікна")
-        chk_always_on_top = Gtk.CheckButton(label="Завжди поверх інших вікон")
+        chk_always_on_top = Gtk.CheckButton(label="Поверх інших вікон")
         chk_always_on_top.set_active(self.always_on_top)
         grid_window_behavior.attach(chk_always_on_top, 0, 0, 2, 1)
 
@@ -1314,45 +1629,50 @@ class UdpVideoWindow:
         video_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(video_page, Gtk.Label(label="Відеопотік"))
 
+        # MikroTik
         mt_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         mt_page.set_border_width(8)
 
         frame_mt_conn, grid_mt_conn = self.make_section("Підключення")
         entry_mt_host = Gtk.Entry()
         entry_mt_host.set_text(self.mikrotik_host or "")
-        self.add_labeled_row(grid_mt_conn, 0, "Адреса MikroTik:", entry_mt_host)
+        self.add_labeled_row(grid_mt_conn, 0, "MikroTik host:", entry_mt_host)
 
         entry_mt_user = Gtk.Entry()
         entry_mt_user.set_text(self.mikrotik_user)
-        self.add_labeled_row(grid_mt_conn, 1, "Користувач MikroTik:", entry_mt_user)
+        self.add_labeled_row(grid_mt_conn, 1, "Логін:", entry_mt_user)
 
         entry_mt_password = Gtk.Entry()
         entry_mt_password.set_visibility(False)
         entry_mt_password.set_text(self.mikrotik_password)
-        self.add_labeled_row(grid_mt_conn, 2, "Пароль MikroTik:", entry_mt_password)
+        self.add_labeled_row(grid_mt_conn, 2, "Пароль:", entry_mt_password)
 
         frame_mt_if, grid_mt_if = self.make_section("Інтерфейс")
         entry_mt_if = Gtk.Entry()
         entry_mt_if.set_text(self.mikrotik_interface or "")
-        self.add_labeled_row(grid_mt_if, 0, "SFP-інтерфейс:", entry_mt_if)
+        self.add_labeled_row(grid_mt_if, 0, "SFP інтерфейс:", entry_mt_if)
+
+        lbl_version = Gtk.Label(label=f"Версія: {APP_VERSION}")
+        lbl_version.set_xalign(0.0)
 
         mt_page.pack_start(frame_mt_conn, False, False, 0)
         mt_page.pack_start(frame_mt_if, False, False, 0)
+        mt_page.pack_start(lbl_version, False, False, 0)
         mt_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(mt_page, Gtk.Label(label="MikroTik / SFP"))
 
         def apply_defaults_to_widgets():
             spin_x.set_value(0)
-            spin_y.set_value(400)
+            spin_y.set_value(0)
             spin_font.set_value(8)
             chk_bg.set_active(False)
             combo_halign.set_active_id("right")
-            combo_valign.set_active_id("top")
+            combo_valign.set_active_id("bottom")
             chk_show_loss.set_active(True)
             chk_show_distance.set_active(True)
             chk_show_wavelength.set_active(True)
 
-            entry_serial_dev.set_text("")
+            combo_serial_dev.set_active_id("__auto__")
             spin_serial_baud.set_value(420000)
             entry_remote_host.set_text("192.168.121.50")
             spin_remote_port.set_value(9000)
@@ -1379,19 +1699,25 @@ class UdpVideoWindow:
                 apply_defaults_to_widgets()
                 continue
 
+            if response == 2:
+                self.create_desktop_shortcut()
+                continue
+
             if response == Gtk.ResponseType.OK:
                 self.overlay_xpad = spin_x.get_value_as_int()
                 self.overlay_ypad = spin_y.get_value_as_int()
                 self.overlay_font_size = spin_font.get_value_as_int()
                 self.overlay_background = chk_bg.get_active()
                 self.overlay_halign = combo_halign.get_active_id() or "right"
-                self.overlay_valign = combo_valign.get_active_id() or "top"
+                self.overlay_valign = combo_valign.get_active_id() or "bottom"
                 self.show_loss = chk_show_loss.get_active()
                 self.show_distance = chk_show_distance.get_active()
                 self.show_wavelength = chk_show_wavelength.get_active()
 
-                serial_dev_text = entry_serial_dev.get_text().strip()
-                self.serial_dev = serial_dev_text if serial_dev_text else None
+                selected_serial = combo_serial_dev.get_active_id() or "__auto__"
+                self.serial_dev = None if selected_serial == "__auto__" else selected_serial
+                self.auto_controller_enabled = not bool(self.serial_dev)
+
                 self.serial_baudrate = spin_serial_baud.get_value_as_int()
                 self.bridge_remote_host = entry_remote_host.get_text().strip()
                 self.bridge_remote_port = spin_remote_port.get_value_as_int()
@@ -1413,240 +1739,11 @@ class UdpVideoWindow:
                 self.window.set_keep_above(self.always_on_top)
                 self.restart_video_pipeline()
                 self.restart_bridge()
+                self.request_mikrotik_reconnect()
 
             break
 
         dialog.destroy()
-
-    def ensure_bridge_running(self):
-        if not self.bridge_remote_host:
-            return
-
-        if self.bridge is not None and self.bridge.is_alive():
-            return
-
-        if self.bridge is not None:
-            try:
-                self.bridge.stop()
-            except Exception:
-                pass
-            self.bridge = None
-
-        serial_dev_to_use = self.serial_dev
-
-        if not serial_dev_to_use and self.auto_controller_enabled:
-            serial_dev_to_use = find_controller_serial_device()
-
-        if not serial_dev_to_use:
-            return
-
-        try:
-            self.bridge = UdpSerialBridge(
-                remote_host=self.bridge_remote_host,
-                remote_port=self.bridge_remote_port,
-                serial_dev=serial_dev_to_use,
-                baudrate=self.serial_baudrate,
-                local_bind_ip=self.bridge_local_bind_ip,
-                local_bind_port=self.bridge_local_bind_port,
-                verbose=self.bridge_verbose,
-                hex_dump=self.bridge_hex,
-            )
-            self.bridge.start()
-            self.serial_dev = serial_dev_to_use
-            print(f"[INFO] Контролер підключено: {serial_dev_to_use}", flush=True)
-        except Exception as e:
-            print(f"[WARN] Не вдалося запустити міст для {serial_dev_to_use}: {e}", file=sys.stderr)
-            self.bridge = None
-            if self.auto_controller_enabled:
-                self.serial_dev = None
-
-    def controller_watch_loop(self):
-        last_seen = None
-
-        while self.running:
-            try:
-                found = find_controller_serial_device() if self.auto_controller_enabled else self.serial_dev
-
-                if found != last_seen:
-                    if found:
-                        print(f"[INFO] Контролер знайдено: {found}", flush=True)
-                    else:
-                        print("[INFO] Контролер відключено", flush=True)
-                    last_seen = found
-
-                if self.auto_controller_enabled:
-                    if found:
-                        if self.bridge is None or not self.bridge.is_alive():
-                            self.serial_dev = found
-                            self.ensure_bridge_running()
-                    else:
-                        if self.bridge is not None:
-                            print("[INFO] Зупиняю міст, бо контролер зник", flush=True)
-                            try:
-                                self.bridge.stop()
-                            except Exception:
-                                pass
-                            self.bridge = None
-                            self.serial_dev = None
-                else:
-                    if self.bridge is None or not self.bridge.is_alive():
-                        if self.serial_dev:
-                            self.ensure_bridge_running()
-
-                self.set_info_text(self.build_info_text())
-
-            except Exception as e:
-                print(f"[WARN] controller_watch_loop: {e}", file=sys.stderr)
-
-            time.sleep(1.0)
-
-    def build_overlay_text(
-        self,
-        rx_power: Optional[str],
-        tx_power: Optional[str],
-        temperature: Optional[str],
-        voltage: Optional[str],
-        wavelength: Optional[str],
-        distance: Optional[str],
-        error_text: Optional[str] = None,
-    ) -> str:
-        lines = []
-
-        if error_text:
-            lines.append(f"СТАТУС: {error_text}")
-            return "\n".join(lines)
-
-        rx_val = parse_dbm_value(rx_power)
-        tx_val = parse_dbm_value(tx_power)
-
-        if self.show_loss:
-            loss_text = "N/A"
-            if tx_val is not None and rx_val is not None:
-                loss_text = f"{(tx_val - rx_val):.2f} dB"
-            lines.append(f"LOSS: {loss_text}")
-
-        wl_dist = []
-        if self.show_wavelength and wavelength:
-            wl_dist.append(f"WL: {wavelength}")
-        if self.show_distance and distance:
-            wl_dist.append(f"DIST: {distance}")
-
-        if wl_dist:
-            lines.append(" | ".join(wl_dist))
-
-        return "\n".join(lines)
-
-    def ensure_mikrotik_ready(self) -> bool:
-        if not self.mikrotik_host:
-            self.set_overlay_text("СТАТУС: Пошук MikroTik через SSH...")
-            found = auto_discover_mikrotik(
-                username=self.mikrotik_user,
-                password=self.mikrotik_password,
-                port=self.ssh_port,
-            )
-            if not found:
-                self.set_overlay_text(
-                    "СТАТУС: MikroTik не знайдено через SSH\n"
-                    "Перевірте IP-підключення або задайте --mikrotik-host"
-                )
-                self.set_info_text(self.build_info_text())
-                return False
-            self.mikrotik_host = found
-
-        self.mt_client = MikroTikSshClient(
-            host=self.mikrotik_host,
-            username=self.mikrotik_user,
-            password=self.mikrotik_password,
-            port=self.ssh_port,
-        )
-
-        self.mt_client.connect()
-        self.identity_name = self.mt_client.get_identity() or ""
-
-        if not self.mikrotik_interface:
-            self.set_overlay_text("СТАТУС: Пошук SFP-інтерфейсу...")
-            found_if = self.mt_client.auto_discover_sfp_interface()
-            if not found_if:
-                self.set_overlay_text(
-                    f"HOST: {self.mikrotik_host}:{self.ssh_port}\nСТАТУС: SFP-інтерфейс не знайдено"
-                )
-                self.set_info_text(self.build_info_text())
-                return False
-            self.mikrotik_interface = found_if
-
-        self.set_info_text(self.build_info_text())
-        return True
-
-    def poll_mikrotik_loop(self):
-        try:
-            if not self.ensure_mikrotik_ready():
-                return
-
-            while self.running:
-                try:
-                    rx_power, tx_power, temperature, voltage, wavelength, distance = (
-                        self.mt_client.fetch_sfp_status(self.mikrotik_interface)
-                    )
-                    text = self.build_overlay_text(
-                        rx_power=rx_power,
-                        tx_power=tx_power,
-                        temperature=temperature,
-                        voltage=voltage,
-                        wavelength=wavelength,
-                        distance=distance,
-                    )
-                except Exception as e:
-                    try:
-                        if self.mt_client is not None:
-                            self.mt_client.disconnect()
-                            self.mt_client.connect()
-                    except Exception:
-                        pass
-
-                    text = self.build_overlay_text(
-                        rx_power=None,
-                        tx_power=None,
-                        temperature=None,
-                        voltage=None,
-                        wavelength=None,
-                        distance=None,
-                        error_text=f"SSH ERROR: {type(e).__name__}",
-                    )
-
-                self.set_overlay_text(text)
-                self.set_info_text(self.build_info_text())
-                time.sleep(self.poll_interval)
-
-        except Exception as e:
-            self.set_overlay_text(f"СТАТУС: ПОМИЛКА ІНІЦІАЛІЗАЦІЇ: {type(e).__name__}")
-            print(f"Init error: {e}", file=sys.stderr)
-
-    def bridge_info_loop(self):
-        while self.running:
-            try:
-                self.check_bridge_health()
-                self.set_info_text(self.build_info_text())
-            except Exception as e:
-                print(f"[WARN] bridge_info_loop: {e}", file=sys.stderr)
-            time.sleep(1.0)
-
-    def on_bus_message(self, bus, message):
-        msg_type = message.type
-
-        if msg_type == Gst.MessageType.ERROR:
-            err, debug = message.parse_error()
-            print("GStreamer ERROR:", err, file=sys.stderr)
-            if debug:
-                print("DEBUG:", debug, file=sys.stderr)
-
-        elif msg_type == Gst.MessageType.WARNING:
-            warn, debug = message.parse_warning()
-            print("GStreamer WARNING:", warn, file=sys.stderr)
-            if debug:
-                print("DEBUG:", debug, file=sys.stderr)
-
-        elif msg_type == Gst.MessageType.EOS:
-            print("Кінець потоку")
 
     def on_destroy(self, widget):
         self.running = False
@@ -1654,8 +1751,10 @@ class UdpVideoWindow:
         if self.bridge is not None:
             self.bridge.stop()
 
-        if self.mt_client is not None:
-            self.mt_client.disconnect()
+        with self.mt_lock:
+            if self.mt_client is not None:
+                self.mt_client.disconnect()
+                self.mt_client = None
 
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
@@ -1665,101 +1764,31 @@ class UdpVideoWindow:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Переглядач UDP H.264 з автопошуком MikroTik по SSH та опційним UDP<->Serial мостом"
+        description="UDP H.264 viewer with MikroTik SSH auto-discovery and optional UDP<->Serial bridge"
     )
-    parser.add_argument("--port", type=int, default=5600, help="UDP-порт відео")
-    parser.add_argument(
-        "--mode",
-        choices=["raw", "rtp"],
-        default="rtp",
-        help="Тип потоку: raw H264 або RTP H264",
-    )
-    parser.add_argument(
-        "--always-on-top",
-        action="store_true",
-        help="Тримати вікно поверх інших",
-    )
+    parser.add_argument("--port", type=int, default=5600, help="UDP порт відео")
+    parser.add_argument("--mode", choices=["raw", "rtp"], default="rtp", help="Тип потоку: raw H264 або RTP H264")
+    parser.add_argument("--always-on-top", action="store_true", help="Тримати вікно поверх інших")
 
-    parser.add_argument(
-        "--mikrotik-host",
-        default="192.168.121.1",
-        help="IP-адреса MikroTik. Якщо не вказано — буде автопошук по SSH",
-    )
-    parser.add_argument(
-        "--mikrotik-user",
-        default="admin",
-        help="Логін MikroTik",
-    )
-    parser.add_argument(
-        "--mikrotik-password",
-        default="",
-        help="Пароль MikroTik",
-    )
-    parser.add_argument(
-        "--mikrotik-interface",
-        default="sfp1",
-        help="SFP-інтерфейс. Якщо не вказано — буде автопошук",
-    )
-    parser.add_argument(
-        "--poll-interval",
-        type=float,
-        default=2.0,
-        help="Інтервал опитування в секундах",
-    )
-    parser.add_argument(
-        "--ssh-port",
-        type=int,
-        default=22,
-        help="Порт SSH MikroTik",
-    )
+    parser.add_argument("--mikrotik-host", default="192.168.121.1", help="IP MikroTik")
+    parser.add_argument("--mikrotik-user", default="admin", help="Логін MikroTik")
+    parser.add_argument("--mikrotik-password", default="", help="Пароль MikroTik")
+    parser.add_argument("--mikrotik-interface", default="sfp1", help="SFP інтерфейс")
+    parser.add_argument("--poll-interval", type=float, default=2.0, help="Інтервал опитування в секундах")
+    parser.add_argument("--ssh-port", type=int, default=22, help="Порт SSH MikroTik")
 
-    parser.add_argument(
-        "--serial-dev",
-        default="",
-        help="Serial device для bridge, наприклад /dev/ttyACM0. Якщо не вказано — буде автопошук Pico",
-    )
-    parser.add_argument(
-        "--serial-baudrate",
-        type=int,
-        default=420000,
-        help="Швидкість baud для bridge",
-    )
-    parser.add_argument(
-        "--bridge-remote-host",
-        default="192.168.121.50",
-        help="Віддалена UDP IP-адреса для bridge",
-    )
-    parser.add_argument(
-        "--bridge-remote-port",
-        type=int,
-        default=9000,
-        help="Віддалений UDP-порт для bridge",
-    )
-    parser.add_argument(
-        "--bridge-local-bind-ip",
-        default="0.0.0.0",
-        help="Локальний bind IP для bridge",
-    )
-    parser.add_argument(
-        "--bridge-local-bind-port",
-        type=int,
-        default=0,
-        help="Локальний bind порт для bridge, 0 = автоматично",
-    )
-    parser.add_argument(
-        "--bridge-verbose",
-        action="store_true",
-        help="Показувати логи bridge",
-    )
-    parser.add_argument(
-        "--bridge-hex",
-        action="store_true",
-        help="Показувати hex у логах bridge",
-    )
+    parser.add_argument("--serial-dev", default="", help="Serial device для bridge")
+    parser.add_argument("--serial-baudrate", type=int, default=420000, help="Baudrate для bridge")
+    parser.add_argument("--bridge-remote-host", default="192.168.121.50", help="Віддалена UDP IP-адреса для bridge")
+    parser.add_argument("--bridge-remote-port", type=int, default=9000, help="Віддалений UDP порт для bridge")
+    parser.add_argument("--bridge-local-bind-ip", default="0.0.0.0", help="Локальний bind IP для bridge")
+    parser.add_argument("--bridge-local-bind-port", type=int, default=0, help="Локальний bind порт для bridge")
+    parser.add_argument("--bridge-verbose", action="store_true", help="Показувати логи bridge")
+    parser.add_argument("--bridge-hex", action="store_true", help="Показувати hex у логах bridge")
 
     args = parser.parse_args()
 
-    UdpVideoWindow(
+    window = UdpVideoWindow(
         port=args.port,
         mode=args.mode,
         always_on_top=args.always_on_top,
@@ -1778,6 +1807,7 @@ def main():
         bridge_verbose=args.bridge_verbose,
         bridge_hex=args.bridge_hex,
     )
+    window.window.show_all()
     Gtk.main()
 
 

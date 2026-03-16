@@ -3,12 +3,13 @@ import argparse
 import binascii
 import ipaddress
 import json
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import gi
 import paramiko
@@ -70,6 +71,96 @@ def tcp_connectable(host: str, port: int, timeout: float = 0.5) -> bool:
             return True
     except Exception:
         return False
+
+
+def parse_dbm_value(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+
+    cleaned = value.strip().lower()
+    cleaned = cleaned.replace("dbm", "").strip()
+
+    # лишаємо тільки число з можливим знаком і крапкою
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", cleaned)
+    if not match:
+        return None
+
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
+
+
+def normalize_wavelength_text(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    if "nm" in cleaned.lower():
+        return cleaned
+
+    match = re.search(r"(\d{3,4})", cleaned)
+    if match:
+        return f"{match.group(1)}nm"
+
+    return cleaned
+
+
+def normalize_distance_text(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    lower = cleaned.lower()
+
+    if "km" in lower:
+        return cleaned
+    if "m" in lower and "km" not in lower:
+        return cleaned
+
+    match_km = re.search(r"(\d+(?:\.\d+)?)", cleaned)
+    if match_km:
+        return f"{match_km.group(1)}km"
+
+    return cleaned
+
+
+def infer_wavelength_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+
+    match = re.search(r"\b(850|1310|1490|1550|1577|1270)\s*nm\b", text, re.IGNORECASE)
+    if match:
+        return f"{match.group(1)}nm"
+
+    match = re.search(r"\b(850|1310|1490|1550|1577|1270)\b", text)
+    if match:
+        return f"{match.group(1)}nm"
+
+    return None
+
+
+def infer_distance_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*km\b", text, re.IGNORECASE)
+    if match:
+        return f"{match.group(1)}km"
+
+    # інколи в part number є просто 20 / 40 / 80 / 120 як дальність
+    # але не хочемо ловити будь-які числа, тому обмежимо типовими значеннями
+    match = re.search(r"\b(1|2|3|5|10|20|40|60|80|100|120)\b", text)
+    if match:
+        return f"{match.group(1)}km"
+
+    return None
 
 
 def find_controller_serial_device() -> Optional[str]:
@@ -150,7 +241,17 @@ class MikroTikSshClient:
 
         return None
 
-    def fetch_sfp_status(self, interface_name: str):
+    def fetch_sfp_status(
+        self,
+        interface_name: str,
+    ) -> Tuple[
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+    ]:
         cmd = f'/interface ethernet monitor "{interface_name}" once'
         out = self.run_command(cmd)
 
@@ -158,22 +259,50 @@ class MikroTikSshClient:
         tx_power = None
         temperature = None
         voltage = None
+        wavelength = None
+        distance = None
+
+        vendor_name = None
+        vendor_part = None
+        model = None
 
         for line in out.splitlines():
             line = line.strip()
+            lower = line.lower()
 
-            if "sfp-rx-power:" in line:
+            if "sfp-rx-power:" in lower:
                 rx_power = line.split(":", 1)[1].strip()
-            elif "sfp-tx-power:" in line:
+            elif "sfp-tx-power:" in lower:
                 tx_power = line.split(":", 1)[1].strip()
-            elif "sfp-temperature:" in line:
+            elif "sfp-temperature:" in lower:
                 temperature = line.split(":", 1)[1].strip()
-            elif "sfp-supply-voltage:" in line:
+            elif "sfp-supply-voltage:" in lower:
                 voltage = line.split(":", 1)[1].strip()
-            elif "sfp-voltage:" in line:
+            elif "sfp-voltage:" in lower:
                 voltage = line.split(":", 1)[1].strip()
+            elif "sfp-wavelength:" in lower:
+                wavelength = line.split(":", 1)[1].strip()
+            elif "sfp-link-length:" in lower:
+                distance = line.split(":", 1)[1].strip()
+            elif "sfp-length:" in lower:
+                distance = line.split(":", 1)[1].strip()
+            elif "sfp-vendor-name:" in lower:
+                vendor_name = line.split(":", 1)[1].strip()
+            elif "sfp-vendor-part-number:" in lower:
+                vendor_part = line.split(":", 1)[1].strip()
+            elif "sfp-part-number:" in lower:
+                vendor_part = line.split(":", 1)[1].strip()
+            elif "sfp-model:" in lower:
+                model = line.split(":", 1)[1].strip()
 
-        return rx_power, tx_power, temperature, voltage
+        extra_text = " ".join(
+            x for x in [vendor_name, vendor_part, model] if x
+        )
+
+        wavelength = normalize_wavelength_text(wavelength) or infer_wavelength_from_text(extra_text)
+        distance = normalize_distance_text(distance) or infer_distance_from_text(extra_text)
+
+        return rx_power, tx_power, temperature, voltage, wavelength, distance
 
 
 def try_mikrotik_ssh(
@@ -712,6 +841,8 @@ class UdpVideoWindow:
         tx_power: Optional[str],
         temperature: Optional[str],
         voltage: Optional[str],
+        wavelength: Optional[str],
+        distance: Optional[str],
         error_text: Optional[str] = None,
     ) -> str:
         lines = []
@@ -732,8 +863,23 @@ class UdpVideoWindow:
             lines.append(f"STATUS: {error_text}")
             return "\n".join(lines)
 
-        lines.append(f"RX: {rx_power or 'N/A'}")
-        lines.append(f"TX: {tx_power or 'N/A'}")
+        rx_val = parse_dbm_value(rx_power)
+        tx_val = parse_dbm_value(tx_power)
+
+        loss_text = "N/A"
+        if tx_val is not None and rx_val is not None:
+            loss_text = f"{(tx_val - rx_val):.2f} dB"
+
+        lines.append(f"LOSS: {loss_text}")
+
+        wl_dist = []
+        if wavelength:
+            wl_dist.append(f"WL: {wavelength}")
+        if distance:
+            wl_dist.append(f"DIST: {distance}")
+
+        if wl_dist:
+            lines.append(" | ".join(wl_dist))
 
         extras = []
         if temperature:
@@ -794,14 +940,16 @@ class UdpVideoWindow:
 
             while self.running:
                 try:
-                    rx_power, tx_power, temperature, voltage = self.mt_client.fetch_sfp_status(
-                        self.mikrotik_interface
+                    rx_power, tx_power, temperature, voltage, wavelength, distance = (
+                        self.mt_client.fetch_sfp_status(self.mikrotik_interface)
                     )
                     text = self.build_overlay_text(
                         rx_power=rx_power,
                         tx_power=tx_power,
                         temperature=temperature,
                         voltage=voltage,
+                        wavelength=wavelength,
+                        distance=distance,
                     )
                 except Exception as e:
                     try:
@@ -816,6 +964,8 @@ class UdpVideoWindow:
                         tx_power=None,
                         temperature=None,
                         voltage=None,
+                        wavelength=None,
+                        distance=None,
                         error_text=f"SSH ERROR: {type(e).__name__}",
                     )
 

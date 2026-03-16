@@ -696,10 +696,12 @@ class UdpVideoWindow:
                 ! videoconvert
                 ! textoverlay name=overlay
                     text="{safe_text}"
-                    valignment=top
-                    halignment=left
-                    shaded-background=true
-                    font-desc="Sans 14"
+                    valignment=bottom
+                    halignment=right
+                    shaded-background=false
+                    xpad=220
+                    ypad=110
+                    font-desc="Sans Bold 8"
                 ! gtksink name=videosink sync=false
             """
 
@@ -715,10 +717,12 @@ class UdpVideoWindow:
                 ! videoconvert
                 ! textoverlay name=overlay
                     text="{safe_text}"
-                    valignment=top
-                    halignment=left
-                    shaded-background=true
-                    font-desc="Sans 14"
+                    valignment=bottom
+                    halignment=right
+                    shaded-background=false
+                    xpad=220
+                    ypad=110
+                    font-desc="Sans Bold 8"
                 ! gtksink name=videosink sync=false
             """
 

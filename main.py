@@ -737,6 +737,13 @@ class UdpVideoWindow:
         self.video_box = Gtk.Box()
         self.video_event_box.add(self.video_box)
 
+        self.placeholder_background = Gtk.EventBox()
+        self.placeholder_background.set_halign(Gtk.Align.FILL)
+        self.placeholder_background.set_valign(Gtk.Align.FILL)
+        self.placeholder_background.set_hexpand(True)
+        self.placeholder_background.set_vexpand(True)
+        self.placeholder_background.set_visible_window(True)
+
         self.placeholder_box = Gtk.Box()
         self.placeholder_box.set_halign(Gtk.Align.FILL)
         self.placeholder_box.set_valign(Gtk.Align.FILL)
@@ -748,7 +755,9 @@ class UdpVideoWindow:
         self.placeholder_inner.set_valign(Gtk.Align.CENTER)
         self.placeholder_inner.set_hexpand(True)
         self.placeholder_inner.set_vexpand(True)
+
         self.placeholder_box.pack_start(self.placeholder_inner, True, True, 0)
+        self.placeholder_background.add(self.placeholder_box)
 
         self.placeholder_image = None
         self.placeholder_label = None
@@ -773,8 +782,22 @@ class UdpVideoWindow:
             self.placeholder_label.set_valign(Gtk.Align.CENTER)
             self.placeholder_inner.pack_start(self.placeholder_label, True, True, 0)
 
-        self.video_overlay.add_overlay(self.placeholder_box)
-        self.placeholder_box.show_all()
+        css = b"""
+        #no-signal-bg {
+            background-color: black;
+        }
+        """
+        self.placeholder_background.set_name("no-signal-bg")
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        self.video_overlay.add_overlay(self.placeholder_background)
+        self.placeholder_background.show_all()
         self.video_overlay.connect("size-allocate", self.on_video_overlay_size_allocate)
 
         self.pipeline = None
@@ -808,6 +831,8 @@ class UdpVideoWindow:
         self.video_signal_thread.start()
 
     def set_default_settings(self):
+        self.enable_telemetry_osd = True
+
         self.overlay_xpad = 0
         self.overlay_ypad = 0
         self.overlay_font_size = 8
@@ -847,6 +872,7 @@ class UdpVideoWindow:
                 data = json.load(f)
 
             osd = data.get("osd", {})
+            self.enable_telemetry_osd = bool(osd.get("enabled", self.enable_telemetry_osd))
             self.overlay_xpad = int(osd.get("xpad", self.overlay_xpad))
             self.overlay_ypad = int(osd.get("ypad", self.overlay_ypad))
             self.overlay_font_size = int(osd.get("font_size", self.overlay_font_size))
@@ -897,6 +923,7 @@ class UdpVideoWindow:
     def save_settings(self):
         data = {
             "osd": {
+                "enabled": self.enable_telemetry_osd,
                 "xpad": self.overlay_xpad,
                 "ypad": self.overlay_ypad,
                 "font_size": self.overlay_font_size,
@@ -942,14 +969,9 @@ class UdpVideoWindow:
         safe_text = self.escape_gst_text(text)
         bg_value = "true" if self.overlay_background else "false"
 
-        if mode == "raw":
-            return f"""
-                udpsrc port={port}
-                    caps="video/x-h264,stream-format=byte-stream,alignment=au"
-                ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 leaky=downstream
-                ! h264parse config-interval=-1 disable-passthrough=true
-                ! decodebin
-                ! videoconvert
+        overlay_block = ""
+        if self.enable_telemetry_osd:
+            overlay_block = f"""
                 ! textoverlay name=overlay
                     text="{safe_text}"
                     valignment={self.overlay_valign}
@@ -958,6 +980,17 @@ class UdpVideoWindow:
                     xpad={self.overlay_xpad}
                     ypad={self.overlay_ypad}
                     font-desc="Sans Bold {self.overlay_font_size}"
+            """
+
+        if mode == "raw":
+            return f"""
+                udpsrc port={port}
+                    caps="video/x-h264,stream-format=byte-stream,alignment=au"
+                ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 leaky=downstream
+                ! h264parse config-interval=-1 disable-passthrough=true
+                ! decodebin
+                ! videoconvert
+                {overlay_block}
                 ! tee name=t
 
                 t. ! queue
@@ -979,14 +1012,7 @@ class UdpVideoWindow:
                 ! h264parse config-interval=-1 disable-passthrough=true
                 ! avdec_h264
                 ! videoconvert
-                ! textoverlay name=overlay
-                    text="{safe_text}"
-                    valignment={self.overlay_valign}
-                    halignment={self.overlay_halign}
-                    shaded-background={bg_value}
-                    xpad={self.overlay_xpad}
-                    ypad={self.overlay_ypad}
-                    font-desc="Sans Bold {self.overlay_font_size}"
+                {overlay_block}
                 ! tee name=t
 
                 t. ! queue
@@ -1010,8 +1036,6 @@ class UdpVideoWindow:
         self.video_sink = self.pipeline.get_by_name("videosink")
         self.monitor_sink = self.pipeline.get_by_name("monitorsink")
 
-        if self.overlay is None:
-            raise RuntimeError("Не вдалося знайти textoverlay")
         if self.video_sink is None:
             raise RuntimeError("Не вдалося знайти gtksink")
         if self.monitor_sink is None:
@@ -1075,11 +1099,11 @@ class UdpVideoWindow:
     def set_placeholder_visible(self, visible: bool):
         self.placeholder_visible = visible
         if visible:
-            self.placeholder_box.show()
+            self.placeholder_background.show()
             alloc = self.video_overlay.get_allocation()
             self.update_placeholder_image_size(alloc.width, alloc.height)
         else:
-            self.placeholder_box.hide()
+            self.placeholder_background.hide()
         return False
 
     def video_signal_loop(self):
@@ -1150,6 +1174,8 @@ class UdpVideoWindow:
             self.top_bar.hide()
 
     def set_overlay_text(self, text: str):
+        if not self.enable_telemetry_osd:
+            return
         if self.overlay is not None:
             GLib.idle_add(self.overlay.set_property, "text", text)
 
@@ -1209,7 +1235,8 @@ class UdpVideoWindow:
             self.identity_name = ""
             self.mikrotik_reconnect_requested = True
 
-        self.set_overlay_text("STATUS: Перепідключення до MikroTik...")
+        if self.enable_telemetry_osd:
+            self.set_overlay_text("STATUS: Перепідключення до MikroTik...")
 
     def check_bridge_health(self):
         if not self.bridge_remote_host:
@@ -1275,6 +1302,9 @@ class UdpVideoWindow:
         return "\n".join(lines)
 
     def ensure_mikrotik_ready(self) -> bool:
+        if not self.enable_telemetry_osd:
+            return False
+
         if not self.mikrotik_host:
             self.set_overlay_text("STATUS: Пошук MikroTik через SSH...")
             found = auto_discover_mikrotik(
@@ -1323,6 +1353,10 @@ class UdpVideoWindow:
     def poll_mikrotik_loop(self):
         while self.running:
             try:
+                if not self.enable_telemetry_osd:
+                    time.sleep(self.poll_interval)
+                    continue
+
                 reconnect_needed = False
                 with self.mt_lock:
                     reconnect_needed = self.mt_client is None or self.mikrotik_reconnect_requested
@@ -1419,6 +1453,15 @@ class UdpVideoWindow:
             print(f"[INFO] Контролер підключено: {serial_dev_to_use}", flush=True)
         except Exception as e:
             print(f"[WARN] Не вдалося запустити bridge для {serial_dev_to_use}: {e}", file=sys.stderr)
+
+            if isinstance(e, serial.SerialException) or "Permission denied" in str(e):
+                print(
+                    "[HINT] Немає доступу до serial-порту. Додайте користувача в групу dialout:\n"
+                    "sudo usermod -aG dialout $USER\n"
+                    "Потім перелогіньтесь або перезавантажтесь.",
+                    file=sys.stderr,
+                )
+
             self.bridge = None
             if self.auto_controller_enabled:
                 self.serial_dev = None
@@ -1598,10 +1641,13 @@ StartupNotify=true
             transient_for=self.window,
             flags=0,
         )
-        dialog.set_default_size(780, 680)
+        dialog.set_default_size(780, 720)
         dialog.set_resizable(True)
 
-        dialog.add_button("Створити ярлик", 2)
+        btn_shortcut = dialog.add_button("Створити ярлик", 2)
+        btn_shortcut.set_sensitive(False)
+        btn_shortcut.set_tooltip_text("У цій версії кнопка тимчасово вимкнена")
+
         dialog.add_button("Скинути", 1)
         dialog.add_button("Скасувати", Gtk.ResponseType.CANCEL)
         dialog.add_button("Застосувати", Gtk.ResponseType.OK)
@@ -1624,15 +1670,17 @@ StartupNotify=true
         info_label = Gtk.Label(
             label=(
                 "OSD — це наекранне меню з даними, які беруться з MikroTik / SFP.\n"
-                "Для виводу:\n"
-                "• затухання\n"
-                "• максимальна дистанція, яку може обробити SFP\n"
-                "• довжина хвилі випромінювання"
+                "Можна повністю вимкнути телеметрію та OSD одним чекбоксом нижче."
             )
         )
         info_label.set_xalign(0.0)
         info_label.set_line_wrap(True)
         info_grid.attach(info_label, 0, 0, 2, 1)
+
+        frame_show, grid_show = self.make_section("Телеметрія та OSD")
+        chk_enable_telemetry_osd = Gtk.CheckButton(label="Увімкнути телеметрію MikroTik і показ OSD")
+        chk_enable_telemetry_osd.set_active(self.enable_telemetry_osd)
+        grid_show.attach(chk_enable_telemetry_osd, 0, 0, 2, 1)
 
         frame_pos, grid_pos = self.make_section("Позиція")
         spin_x = Gtk.SpinButton()
@@ -1670,29 +1718,44 @@ StartupNotify=true
         combo_valign.set_active_id(self.overlay_valign)
         self.add_labeled_row(grid_style, 3, "Вертикально:", combo_valign)
 
-        frame_show, grid_show = self.make_section("Що показувати")
+        frame_data, grid_data = self.make_section("Що показувати")
         chk_show_loss = Gtk.CheckButton(label="Показувати затухання")
         chk_show_loss.set_active(self.show_loss)
-        grid_show.attach(chk_show_loss, 0, 0, 2, 1)
+        grid_data.attach(chk_show_loss, 0, 0, 2, 1)
 
         chk_show_distance = Gtk.CheckButton(label="Показувати максимальну дистанцію SFP")
         chk_show_distance.set_active(self.show_distance)
-        grid_show.attach(chk_show_distance, 0, 1, 2, 1)
+        grid_data.attach(chk_show_distance, 0, 1, 2, 1)
 
         chk_show_wavelength = Gtk.CheckButton(label="Показувати довжину хвилі SFP")
         chk_show_wavelength.set_active(self.show_wavelength)
-        grid_show.attach(chk_show_wavelength, 0, 2, 2, 1)
+        grid_data.attach(chk_show_wavelength, 0, 2, 2, 1)
 
         osd_page.pack_start(info_frame, False, False, 0)
+        osd_page.pack_start(frame_show, False, False, 0)
         osd_page.pack_start(frame_pos, False, False, 0)
         osd_page.pack_start(frame_style, False, False, 0)
-        osd_page.pack_start(frame_show, False, False, 0)
+        osd_page.pack_start(frame_data, False, False, 0)
         osd_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(osd_page, Gtk.Label(label="OSD"))
 
         # Bridge
         bridge_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         bridge_page.set_border_width(8)
+
+        hint_frame, hint_grid = self.make_section("Права доступу до serial-порту")
+        hint_label = Gtk.Label(
+            label=(
+                "Якщо bridge не може відкрити /dev/ttyACM0 або /dev/ttyUSB0 через Permission denied,\n"
+                "виконайте в терміналі:\n\n"
+                "sudo usermod -aG dialout $USER\n\n"
+                "Після цього перелогіньтесь або перезавантажтесь."
+            )
+        )
+        hint_label.set_xalign(0.0)
+        hint_label.set_line_wrap(True)
+        hint_label.set_selectable(True)
+        hint_grid.attach(hint_label, 0, 0, 2, 1)
 
         frame_serial, grid_serial = self.make_section("Serial")
         combo_serial_dev = Gtk.ComboBoxText()
@@ -1747,6 +1810,7 @@ StartupNotify=true
         chk_bridge_hex.set_active(self.bridge_hex)
         grid_logs.attach(chk_bridge_hex, 0, 1, 2, 1)
 
+        bridge_page.pack_start(hint_frame, False, False, 0)
         bridge_page.pack_start(frame_serial, False, False, 0)
         bridge_page.pack_start(frame_udp, False, False, 0)
         bridge_page.pack_start(frame_logs, False, False, 0)
@@ -1811,7 +1875,29 @@ StartupNotify=true
         mt_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(mt_page, Gtk.Label(label="MikroTik / SFP"))
 
+        def update_osd_widgets_state():
+            enabled = chk_enable_telemetry_osd.get_active()
+
+            spin_x.set_sensitive(enabled)
+            spin_y.set_sensitive(enabled)
+            spin_font.set_sensitive(enabled)
+            chk_bg.set_sensitive(enabled)
+            combo_halign.set_sensitive(enabled)
+            combo_valign.set_sensitive(enabled)
+            chk_show_loss.set_sensitive(enabled)
+            chk_show_distance.set_sensitive(enabled)
+            chk_show_wavelength.set_sensitive(enabled)
+
+            entry_mt_host.set_sensitive(enabled)
+            entry_mt_user.set_sensitive(enabled)
+            entry_mt_password.set_sensitive(enabled)
+            entry_mt_if.set_sensitive(enabled)
+
+        chk_enable_telemetry_osd.connect("toggled", lambda *_: update_osd_widgets_state())
+
         def apply_defaults_to_widgets():
+            chk_enable_telemetry_osd.set_active(True)
+
             spin_x.set_value(0)
             spin_y.set_value(0)
             spin_font.set_value(8)
@@ -1840,6 +1926,9 @@ StartupNotify=true
             entry_mt_password.set_text("")
             entry_mt_if.set_text("sfp1")
 
+            update_osd_widgets_state()
+
+        update_osd_widgets_state()
         dialog.show_all()
 
         while True:
@@ -1850,10 +1939,11 @@ StartupNotify=true
                 continue
 
             if response == 2:
-                self.create_desktop_shortcut()
                 continue
 
             if response == Gtk.ResponseType.OK:
+                self.enable_telemetry_osd = chk_enable_telemetry_osd.get_active()
+
                 self.overlay_xpad = spin_x.get_value_as_int()
                 self.overlay_ypad = spin_y.get_value_as_int()
                 self.overlay_font_size = spin_font.get_value_as_int()

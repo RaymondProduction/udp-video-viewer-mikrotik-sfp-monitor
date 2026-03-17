@@ -22,7 +22,7 @@ from serial.tools import list_ports
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gst", "1.0")
-from gi.repository import Gtk, Gst, GLib, Gdk
+from gi.repository import Gtk, Gst, GLib, Gdk, GdkPixbuf
 
 Gst.init(None)
 
@@ -740,20 +740,42 @@ class UdpVideoWindow:
         self.placeholder_box = Gtk.Box()
         self.placeholder_box.set_halign(Gtk.Align.FILL)
         self.placeholder_box.set_valign(Gtk.Align.FILL)
+        self.placeholder_box.set_hexpand(True)
+        self.placeholder_box.set_vexpand(True)
+
+        self.placeholder_inner = Gtk.Box()
+        self.placeholder_inner.set_halign(Gtk.Align.CENTER)
+        self.placeholder_inner.set_valign(Gtk.Align.CENTER)
+        self.placeholder_inner.set_hexpand(True)
+        self.placeholder_inner.set_vexpand(True)
+        self.placeholder_box.pack_start(self.placeholder_inner, True, True, 0)
+
+        self.placeholder_image = None
+        self.placeholder_label = None
+        self.placeholder_original_pixbuf = None
 
         if PLACEHOLDER_IMAGE_FILE.exists():
-            self.placeholder_image = Gtk.Image.new_from_file(str(PLACEHOLDER_IMAGE_FILE))
-            self.placeholder_image.set_halign(Gtk.Align.CENTER)
-            self.placeholder_image.set_valign(Gtk.Align.CENTER)
-            self.placeholder_box.pack_start(self.placeholder_image, True, True, 0)
+            try:
+                self.placeholder_original_pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(PLACEHOLDER_IMAGE_FILE))
+                self.placeholder_image = Gtk.Image()
+                self.placeholder_image.set_halign(Gtk.Align.CENTER)
+                self.placeholder_image.set_valign(Gtk.Align.CENTER)
+                self.placeholder_inner.pack_start(self.placeholder_image, True, True, 0)
+            except Exception as e:
+                print(f"[WARN] Не вдалося завантажити placeholder image: {e}", file=sys.stderr)
+                self.placeholder_label = Gtk.Label(label="Немає сигналу")
+                self.placeholder_label.set_halign(Gtk.Align.CENTER)
+                self.placeholder_label.set_valign(Gtk.Align.CENTER)
+                self.placeholder_inner.pack_start(self.placeholder_label, True, True, 0)
         else:
             self.placeholder_label = Gtk.Label(label="Немає сигналу")
             self.placeholder_label.set_halign(Gtk.Align.CENTER)
             self.placeholder_label.set_valign(Gtk.Align.CENTER)
-            self.placeholder_box.pack_start(self.placeholder_label, True, True, 0)
+            self.placeholder_inner.pack_start(self.placeholder_label, True, True, 0)
 
         self.video_overlay.add_overlay(self.placeholder_box)
         self.placeholder_box.show_all()
+        self.video_overlay.connect("size-allocate", self.on_video_overlay_size_allocate)
 
         self.pipeline = None
         self.overlay = None
@@ -770,6 +792,8 @@ class UdpVideoWindow:
             self.ensure_bridge_running()
 
         self.window.show_all()
+        alloc = self.video_overlay.get_allocation()
+        self.update_placeholder_image_size(alloc.width, alloc.height)
 
         self.poll_thread = threading.Thread(target=self.poll_mikrotik_loop, daemon=True)
         self.poll_thread.start()
@@ -1008,6 +1032,40 @@ class UdpVideoWindow:
     def escape_gst_text(text: str) -> str:
         return text.replace("\\", "\\\\").replace('"', '\\"')
 
+    def on_video_overlay_size_allocate(self, widget, allocation):
+        self.update_placeholder_image_size(allocation.width, allocation.height)
+
+    def update_placeholder_image_size(self, avail_width: int, avail_height: int):
+        if self.placeholder_original_pixbuf is None or self.placeholder_image is None:
+            return
+
+        if avail_width <= 1 or avail_height <= 1:
+            return
+
+        orig_w = self.placeholder_original_pixbuf.get_width()
+        orig_h = self.placeholder_original_pixbuf.get_height()
+
+        if orig_w <= 0 or orig_h <= 0:
+            return
+
+        max_w = max(1, avail_width - 20)
+        max_h = max(1, avail_height - 20)
+
+        scale = min(max_w / orig_w, max_h / orig_h)
+        new_w = max(1, int(orig_w * scale))
+        new_h = max(1, int(orig_h * scale))
+
+        try:
+            scaled = self.placeholder_original_pixbuf.scale_simple(
+                new_w,
+                new_h,
+                GdkPixbuf.InterpType.BILINEAR,
+            )
+            if scaled is not None:
+                self.placeholder_image.set_from_pixbuf(scaled)
+        except Exception as e:
+            print(f"[WARN] Не вдалося масштабувати placeholder image: {e}", file=sys.stderr)
+
     def on_monitor_new_sample(self, sink):
         self.last_video_frame_time = time.time()
         if self.placeholder_visible:
@@ -1018,6 +1076,8 @@ class UdpVideoWindow:
         self.placeholder_visible = visible
         if visible:
             self.placeholder_box.show()
+            alloc = self.video_overlay.get_allocation()
+            self.update_placeholder_image_size(alloc.width, alloc.height)
         else:
             self.placeholder_box.hide()
         return False
@@ -1123,6 +1183,9 @@ class UdpVideoWindow:
         self.window.show_all()
         if self.is_video_fullscreen:
             self.top_bar.hide()
+
+        alloc = self.video_overlay.get_allocation()
+        self.update_placeholder_image_size(alloc.width, alloc.height)
 
     def restart_bridge(self):
         if self.bridge is not None:

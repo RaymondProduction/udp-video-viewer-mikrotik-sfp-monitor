@@ -50,10 +50,6 @@ SETTINGS_FILE = SETTINGS_DIR / "ground_station_settings.json"
 PLACEHOLDER_IMAGE_FILE = Path(__file__).resolve().parent / "80dshv.png"
 
 
-def ensure_parent_dir(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-
 def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
     result = []
     try:
@@ -637,7 +633,7 @@ class VideoEventBox(Gtk.EventBox):
 
     def on_button_press(self, widget, event):
         if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:
-            self.owner.toggle_fullscreen_video()
+            GLib.idle_add(self.owner.toggle_fullscreen_video)
             return True
         return False
 
@@ -709,7 +705,6 @@ class UdpVideoWindow:
 
         self.top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         root.pack_start(self.top_bar, False, False, 0)
-
         self.top_bar.pack_start(Gtk.Label(label=""), True, True, 0)
 
         self.btn_fullscreen = Gtk.Button()
@@ -805,12 +800,12 @@ class UdpVideoWindow:
         self.video_sink = None
         self.bus = None
 
-        self.build_and_start_pipeline("STATUS: Підключення до MikroTik...")
+        self.build_and_start_pipeline(self.get_overlay_text_for_pipeline_start())
+        self.apply_overlay_visual_settings()
         self.set_placeholder_visible(True)
         self.last_video_frame_time = 0.0
 
         self.bridge: Optional[UdpSerialBridge] = None
-
         if self.bridge_remote_host:
             self.ensure_bridge_running()
 
@@ -965,22 +960,25 @@ class UdpVideoWindow:
         except Exception as e:
             print(f"[ERROR] Не вдалося зберегти налаштування: {e}", file=sys.stderr)
 
+    def get_overlay_text_for_pipeline_start(self) -> str:
+        if not self.enable_telemetry_osd:
+            return ""
+        return "STATUS: Підключення до MikroTik..."
+
     def build_pipeline(self, port: int, mode: str, text: str) -> str:
         safe_text = self.escape_gst_text(text)
         bg_value = "true" if self.overlay_background else "false"
 
-        overlay_block = ""
-        if self.enable_telemetry_osd:
-            overlay_block = f"""
-                ! textoverlay name=overlay
-                    text="{safe_text}"
-                    valignment={self.overlay_valign}
-                    halignment={self.overlay_halign}
-                    shaded-background={bg_value}
-                    xpad={self.overlay_xpad}
-                    ypad={self.overlay_ypad}
-                    font-desc="Sans Bold {self.overlay_font_size}"
-            """
+        overlay_block = f"""
+            ! textoverlay name=overlay
+                text="{safe_text}"
+                valignment={self.overlay_valign}
+                halignment={self.overlay_halign}
+                shaded-background={bg_value}
+                xpad={self.overlay_xpad}
+                ypad={self.overlay_ypad}
+                font-desc="Sans Bold {self.overlay_font_size}"
+        """
 
         if mode == "raw":
             return f"""
@@ -1040,6 +1038,8 @@ class UdpVideoWindow:
             raise RuntimeError("Не вдалося знайти gtksink")
         if self.monitor_sink is None:
             raise RuntimeError("Не вдалося знайти monitorsink")
+        if self.overlay is None:
+            raise RuntimeError("Не вдалося знайти textoverlay")
 
         self.monitor_sink.connect("new-sample", self.on_monitor_new_sample)
 
@@ -1056,8 +1056,33 @@ class UdpVideoWindow:
     def escape_gst_text(text: str) -> str:
         return text.replace("\\", "\\\\").replace('"', '\\"')
 
+    def apply_overlay_visual_settings(self):
+        if self.overlay is None:
+            return
+
+        bg_value = self.overlay_background
+        font_desc = f"Sans Bold {self.overlay_font_size}"
+
+        GLib.idle_add(self.overlay.set_property, "xpad", self.overlay_xpad)
+        GLib.idle_add(self.overlay.set_property, "ypad", self.overlay_ypad)
+        GLib.idle_add(self.overlay.set_property, "halignment", self.overlay_halign)
+        GLib.idle_add(self.overlay.set_property, "valignment", self.overlay_valign)
+        GLib.idle_add(self.overlay.set_property, "shaded-background", bg_value)
+        GLib.idle_add(self.overlay.set_property, "font-desc", font_desc)
+
+    def refresh_video_area(self):
+        self.video_overlay.queue_draw()
+        self.video_box.queue_draw()
+
+        if self.placeholder_visible:
+            alloc = self.video_overlay.get_allocation()
+            self.update_placeholder_image_size(alloc.width, alloc.height)
+
+        return False
+
     def on_video_overlay_size_allocate(self, widget, allocation):
-        self.update_placeholder_image_size(allocation.width, allocation.height)
+        if self.placeholder_visible:
+            self.update_placeholder_image_size(allocation.width, allocation.height)
 
     def update_placeholder_image_size(self, avail_width: int, avail_height: int):
         if self.placeholder_original_pixbuf is None or self.placeholder_image is None:
@@ -1128,15 +1153,15 @@ class UdpVideoWindow:
             time.sleep(0.2)
 
     def on_fullscreen_button_clicked(self, widget):
-        self.toggle_fullscreen_video()
+        GLib.idle_add(self.toggle_fullscreen_video)
 
     def on_key_press(self, widget, event):
         if event.keyval == Gdk.KEY_F11:
-            self.toggle_fullscreen_video()
+            GLib.idle_add(self.toggle_fullscreen_video)
             return True
 
         if event.keyval == Gdk.KEY_Escape and self.is_video_fullscreen:
-            self.toggle_fullscreen_video(False)
+            GLib.idle_add(self.toggle_fullscreen_video, False)
             return True
 
         return False
@@ -1148,7 +1173,7 @@ class UdpVideoWindow:
             new_state = force_state
 
         if new_state == self.is_video_fullscreen:
-            return
+            return False
 
         self.is_video_fullscreen = new_state
 
@@ -1169,15 +1194,15 @@ class UdpVideoWindow:
             )
             self.btn_fullscreen.set_tooltip_text("На весь екран")
 
-        self.window.show_all()
-        if self.is_video_fullscreen:
-            self.top_bar.hide()
+        GLib.idle_add(self.refresh_video_area)
+        return False
 
     def set_overlay_text(self, text: str):
-        if not self.enable_telemetry_osd:
-            return
         if self.overlay is not None:
             GLib.idle_add(self.overlay.set_property, "text", text)
+
+    def clear_overlay_text(self):
+        self.set_overlay_text("")
 
     def restart_video_pipeline(self):
         old_text = ""
@@ -1205,13 +1230,24 @@ class UdpVideoWindow:
         self.last_video_frame_time = 0.0
         self.set_placeholder_visible(True)
 
-        self.build_and_start_pipeline(old_text or "STATUS: Підключення до MikroTik...")
-        self.window.show_all()
+        new_text = old_text
+        if not self.enable_telemetry_osd:
+            new_text = ""
+        if not new_text:
+            new_text = self.get_overlay_text_for_pipeline_start()
+
+        self.build_and_start_pipeline(new_text)
+        self.apply_overlay_visual_settings()
+
+        self.video_overlay.queue_draw()
+        self.video_box.queue_draw()
+
         if self.is_video_fullscreen:
             self.top_bar.hide()
 
-        alloc = self.video_overlay.get_allocation()
-        self.update_placeholder_image_size(alloc.width, alloc.height)
+        if self.placeholder_visible:
+            alloc = self.video_overlay.get_allocation()
+            self.update_placeholder_image_size(alloc.width, alloc.height)
 
     def restart_bridge(self):
         if self.bridge is not None:
@@ -1223,6 +1259,19 @@ class UdpVideoWindow:
 
         if self.bridge_remote_host:
             self.ensure_bridge_running()
+
+    def disable_mikrotik_runtime(self):
+        with self.mt_lock:
+            if self.mt_client is not None:
+                try:
+                    self.mt_client.disconnect()
+                except Exception:
+                    pass
+            self.mt_client = None
+            self.identity_name = ""
+            self.mikrotik_reconnect_requested = False
+
+        self.clear_overlay_text()
 
     def request_mikrotik_reconnect(self):
         with self.mt_lock:
@@ -1237,6 +1286,8 @@ class UdpVideoWindow:
 
         if self.enable_telemetry_osd:
             self.set_overlay_text("STATUS: Перепідключення до MikroTik...")
+        else:
+            self.clear_overlay_text()
 
     def check_bridge_health(self):
         if not self.bridge_remote_host:
@@ -1275,6 +1326,9 @@ class UdpVideoWindow:
         distance: Optional[str],
         error_text: Optional[str] = None,
     ) -> str:
+        if not self.enable_telemetry_osd:
+            return ""
+
         lines = []
 
         if error_text:
@@ -1942,6 +1996,28 @@ StartupNotify=true
                 continue
 
             if response == Gtk.ResponseType.OK:
+                prev_video_port = self.port
+                prev_video_mode = self.mode
+                prev_enable_telemetry_osd = self.enable_telemetry_osd
+
+                prev_bridge_state = (
+                    self.serial_dev,
+                    self.serial_baudrate,
+                    self.bridge_remote_host,
+                    self.bridge_remote_port,
+                    self.bridge_local_bind_ip,
+                    self.bridge_local_bind_port,
+                    self.bridge_verbose,
+                    self.bridge_hex,
+                )
+
+                prev_mikrotik_state = (
+                    self.mikrotik_host,
+                    self.mikrotik_user,
+                    self.mikrotik_password,
+                    self.mikrotik_interface,
+                )
+
                 self.enable_telemetry_osd = chk_enable_telemetry_osd.get_active()
 
                 self.overlay_xpad = spin_x.get_value_as_int()
@@ -1977,9 +2053,50 @@ StartupNotify=true
 
                 self.save_settings()
                 self.window.set_keep_above(self.always_on_top)
-                self.restart_video_pipeline()
-                self.restart_bridge()
-                self.request_mikrotik_reconnect()
+
+                video_pipeline_changed = (self.port != prev_video_port) or (self.mode != prev_video_mode)
+
+                bridge_state = (
+                    self.serial_dev,
+                    self.serial_baudrate,
+                    self.bridge_remote_host,
+                    self.bridge_remote_port,
+                    self.bridge_local_bind_ip,
+                    self.bridge_local_bind_port,
+                    self.bridge_verbose,
+                    self.bridge_hex,
+                )
+                bridge_changed = bridge_state != prev_bridge_state
+
+                mikrotik_state = (
+                    self.mikrotik_host,
+                    self.mikrotik_user,
+                    self.mikrotik_password,
+                    self.mikrotik_interface,
+                )
+                mikrotik_changed = mikrotik_state != prev_mikrotik_state
+
+                if video_pipeline_changed:
+                    self.restart_video_pipeline()
+                else:
+                    self.apply_overlay_visual_settings()
+                    if self.enable_telemetry_osd:
+                        if not prev_enable_telemetry_osd:
+                            self.set_overlay_text("STATUS: Підключення до MikroTik...")
+                        GLib.idle_add(self.refresh_video_area)
+                    else:
+                        self.clear_overlay_text()
+                        GLib.idle_add(self.refresh_video_area)
+
+                if bridge_changed:
+                    self.restart_bridge()
+
+                if self.enable_telemetry_osd:
+                    if mikrotik_changed or (prev_enable_telemetry_osd != self.enable_telemetry_osd):
+                        self.request_mikrotik_reconnect()
+                else:
+                    if prev_enable_telemetry_osd:
+                        self.disable_mikrotik_runtime()
 
             break
 
@@ -2020,9 +2137,9 @@ def main():
     parser.add_argument("--serial-dev", default="", help="Serial device для bridge")
     parser.add_argument("--serial-baudrate", type=int, default=420000, help="Baudrate для bridge")
     parser.add_argument("--bridge-remote-host", default="192.168.121.50", help="Віддалена UDP IP-адреса для bridge")
-    parser.add_argument("--bridge-remote-port", type=int, default=9000, help="Віддалений UDP порт для bridge")
+    parser.add_argument("--bridge-remote-port", default=9000, type=int, help="Віддалений UDP порт для bridge")
     parser.add_argument("--bridge-local-bind-ip", default="0.0.0.0", help="Локальний bind IP для bridge")
-    parser.add_argument("--bridge-local-bind-port", type=int, default=0, help="Локальний bind порт для bridge")
+    parser.add_argument("--bridge-local-bind-port", default=0, type=int, help="Локальний bind порт для bridge")
     parser.add_argument("--bridge-verbose", action="store_true", help="Показувати логи bridge")
     parser.add_argument("--bridge-hex", action="store_true", help="Показувати hex у логах bridge")
 

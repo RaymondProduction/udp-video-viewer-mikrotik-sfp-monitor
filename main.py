@@ -27,8 +27,31 @@ from gi.repository import Gtk, Gst, GLib, Gdk, GdkPixbuf
 Gst.init(None)
 
 APP_VERSION = "0.1 beta"
-APP_NAME = "Наземна станція для Князь Вандам Галацький"
+APP_NAME = "Наземна станція для Принц Вандам Галицький"
 APP_ID = "knyaz-vandam-ground-station"
+
+
+def get_app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+
+        exe_path = Path(sys.executable).resolve()
+        return exe_path.parent
+
+    return Path(__file__).resolve().parent
+
+
+def resource_path(*parts: str) -> Path:
+    return get_app_base_dir().joinpath(*parts)
+
+
+def first_existing_path(candidates: List[Path]) -> Optional[Path]:
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
 
 
 def get_user_config_dir() -> Path:
@@ -47,7 +70,14 @@ def get_user_data_dir() -> Path:
 
 SETTINGS_DIR = get_user_config_dir()
 SETTINGS_FILE = SETTINGS_DIR / "ground_station_settings.json"
-PLACEHOLDER_IMAGE_FILE = Path(__file__).resolve().parent / "80dshv.png"
+PLACEHOLDER_IMAGE_FILE = first_existing_path(
+    [
+        resource_path("vandam.jpg"),
+        resource_path("vandam.jpeg"),
+        resource_path("vandam.png"),
+        resource_path("80dshv.png"),
+    ]
+)
 
 
 def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
@@ -758,7 +788,7 @@ class UdpVideoWindow:
         self.placeholder_label = None
         self.placeholder_original_pixbuf = None
 
-        if PLACEHOLDER_IMAGE_FILE.exists():
+        if PLACEHOLDER_IMAGE_FILE and PLACEHOLDER_IMAGE_FILE.exists():
             try:
                 self.placeholder_original_pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(PLACEHOLDER_IMAGE_FILE))
                 self.placeholder_image = Gtk.Image()
@@ -1597,14 +1627,16 @@ class UdpVideoWindow:
 
     def find_icon_source(self) -> Optional[Path]:
         candidates = [
+            resource_path("prince_ground_station.png"),
+            resource_path("prince.png"),
+            resource_path("icon.png"),
+            resource_path("app.png"),
+            Path(__file__).resolve().parent / "prince_ground_station.png",
             Path(__file__).resolve().parent / "prince.png",
             Path(__file__).resolve().parent / "icon.png",
             Path(__file__).resolve().parent / "app.png",
         ]
-        for path in candidates:
-            if path.exists():
-                return path
-        return None
+        return first_existing_path(candidates)
 
     def create_desktop_shortcut(self):
         try:
@@ -1716,7 +1748,6 @@ StartupNotify=true
         notebook.set_vexpand(True)
         outer_box.pack_start(notebook, True, True, 0)
 
-        # OSD
         osd_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         osd_page.set_border_width(8)
 
@@ -1793,7 +1824,6 @@ StartupNotify=true
         osd_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(osd_page, Gtk.Label(label="OSD"))
 
-        # Bridge
         bridge_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         bridge_page.set_border_width(8)
 
@@ -1871,7 +1901,6 @@ StartupNotify=true
         bridge_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(bridge_page, Gtk.Label(label="Міст керування"))
 
-        # Video
         video_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         video_page.set_border_width(8)
 
@@ -1897,7 +1926,6 @@ StartupNotify=true
         video_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(video_page, Gtk.Label(label="Відеопотік"))
 
-        # MikroTik
         mt_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         mt_page.set_border_width(8)
 

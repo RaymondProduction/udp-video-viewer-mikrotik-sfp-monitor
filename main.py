@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 import gi
 import paramiko
@@ -68,14 +68,29 @@ def get_user_data_dir() -> Path:
     return Path.home() / ".local" / "share" / APP_ID
 
 
+def get_desktop_dir() -> Path:
+    try:
+        output = subprocess.check_output(["xdg-user-dir", "DESKTOP"], text=True).strip()
+        if output:
+            return Path(output)
+    except Exception:
+        pass
+    return Path.home() / "Desktop"
+
+
 SETTINGS_DIR = get_user_config_dir()
 SETTINGS_FILE = SETTINGS_DIR / "ground_station_settings.json"
+
 PLACEHOLDER_IMAGE_FILE = first_existing_path(
     [
+        resource_path("vandam.png"),
         resource_path("vandam.jpg"),
         resource_path("vandam.jpeg"),
-        resource_path("vandam.png"),
         resource_path("80dshv.png"),
+        Path(__file__).resolve().parent / "vandam.png",
+        Path(__file__).resolve().parent / "vandam.jpg",
+        Path(__file__).resolve().parent / "vandam.jpeg",
+        Path(__file__).resolve().parent / "80dshv.png",
     ]
 )
 
@@ -101,7 +116,6 @@ def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
                     continue
 
                 network = ipaddress.ip_network(f"{local}/{prefixlen}", strict=False)
-
                 if network.prefixlen < 24:
                     network = ipaddress.ip_network(f"{local}/24", strict=False)
 
@@ -119,6 +133,44 @@ def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
             seen.add(net_str)
 
     return unique
+
+
+def get_local_ipv4_interfaces() -> List[Dict[str, str]]:
+    result = []
+    try:
+        output = subprocess.check_output(
+            ["ip", "-j", "-4", "addr", "show", "up"],
+            text=True,
+        )
+        data = json.loads(output)
+
+        for iface in data:
+            iface_name = iface.get("ifname", "")
+            for addr_info in iface.get("addr_info", []):
+                local = addr_info.get("local")
+                prefixlen = addr_info.get("prefixlen")
+                if not local or prefixlen is None:
+                    continue
+
+                ip_obj = ipaddress.ip_address(local)
+                if ip_obj.is_loopback:
+                    continue
+
+                network = ipaddress.ip_network(f"{local}/{prefixlen}", strict=False)
+                if network.prefixlen < 24:
+                    network = ipaddress.ip_network(f"{local}/24", strict=False)
+
+                result.append(
+                    {
+                        "ifname": iface_name,
+                        "ip": local,
+                        "network": str(network),
+                    }
+                )
+    except Exception as e:
+        print(f"Не вдалося отримати список інтерфейсів: {e}", file=sys.stderr)
+
+    return result
 
 
 def tcp_connectable(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -712,6 +764,9 @@ class UdpVideoWindow:
         self.auto_controller_enabled = not bool(self.serial_dev)
         self.is_video_fullscreen = False
 
+        self.default_root_border = 8
+        self.default_root_spacing = 6
+
         self.mt_client: Optional[MikroTikSshClient] = None
         self.mt_lock = threading.Lock()
         self.mikrotik_reconnect_requested = False
@@ -724,17 +779,21 @@ class UdpVideoWindow:
         self.load_settings()
 
         self.window = Gtk.Window(title=APP_NAME)
+        self.window.set_name("video-window")
         self.window.set_default_size(1100, 700)
         self.window.set_keep_above(self.always_on_top)
         self.window.connect("destroy", self.on_destroy)
         self.window.connect("key-press-event", self.on_key_press)
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        root.set_border_width(8)
-        self.window.add(root)
+        self.apply_css()
+
+        self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=self.default_root_spacing)
+        self.root.set_name("video-root")
+        self.root.set_border_width(self.default_root_border)
+        self.window.add(self.root)
 
         self.top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        root.pack_start(self.top_bar, False, False, 0)
+        self.root.pack_start(self.top_bar, False, False, 0)
         self.top_bar.pack_start(Gtk.Label(label=""), True, True, 0)
 
         self.btn_fullscreen = Gtk.Button()
@@ -750,8 +809,9 @@ class UdpVideoWindow:
         self.top_bar.pack_start(btn_settings, False, False, 0)
 
         self.frame_video = Gtk.Frame()
+        self.frame_video.set_name("video-frame")
         self.frame_video.set_shadow_type(Gtk.ShadowType.IN)
-        root.pack_start(self.frame_video, True, True, 0)
+        self.root.pack_start(self.frame_video, True, True, 0)
 
         self.video_overlay = Gtk.Overlay()
         self.frame_video.add(self.video_overlay)
@@ -762,12 +822,14 @@ class UdpVideoWindow:
         self.video_box = Gtk.Box()
         self.video_event_box.add(self.video_box)
 
-        self.placeholder_background = Gtk.EventBox()
+        self.placeholder_background = Gtk.Overlay()
+        self.placeholder_background.set_name("no-signal-bg")
         self.placeholder_background.set_halign(Gtk.Align.FILL)
         self.placeholder_background.set_valign(Gtk.Align.FILL)
         self.placeholder_background.set_hexpand(True)
         self.placeholder_background.set_vexpand(True)
-        self.placeholder_background.set_visible_window(True)
+        self.placeholder_background.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+        self.placeholder_background.connect("button-press-event", self.on_placeholder_button_press)
 
         self.placeholder_box = Gtk.Box()
         self.placeholder_box.set_halign(Gtk.Align.FILL)
@@ -785,7 +847,13 @@ class UdpVideoWindow:
         self.placeholder_background.add(self.placeholder_box)
 
         self.placeholder_image = None
-        self.placeholder_label = None
+        self.placeholder_label = Gtk.Label(label="Немає сигналу з дроном")
+        self.placeholder_label.set_name("no-signal-label")
+        self.placeholder_label.set_halign(Gtk.Align.CENTER)
+        self.placeholder_label.set_valign(Gtk.Align.CENTER)
+        self.placeholder_label.set_justify(Gtk.Justification.CENTER)
+        self.placeholder_label.set_line_wrap(True)
+
         self.placeholder_original_pixbuf = None
 
         if PLACEHOLDER_IMAGE_FILE and PLACEHOLDER_IMAGE_FILE.exists():
@@ -797,29 +865,14 @@ class UdpVideoWindow:
                 self.placeholder_inner.pack_start(self.placeholder_image, True, True, 0)
             except Exception as e:
                 print(f"[WARN] Не вдалося завантажити placeholder image: {e}", file=sys.stderr)
-                self.placeholder_label = Gtk.Label(label="Немає сигналу")
-                self.placeholder_label.set_halign(Gtk.Align.CENTER)
-                self.placeholder_label.set_valign(Gtk.Align.CENTER)
-                self.placeholder_inner.pack_start(self.placeholder_label, True, True, 0)
-        else:
-            self.placeholder_label = Gtk.Label(label="Немає сигналу")
-            self.placeholder_label.set_halign(Gtk.Align.CENTER)
-            self.placeholder_label.set_valign(Gtk.Align.CENTER)
-            self.placeholder_inner.pack_start(self.placeholder_label, True, True, 0)
 
-        css = b"""
-        #no-signal-bg {
-            background-color: black;
-        }
-        """
-        self.placeholder_background.set_name("no-signal-bg")
-        css_provider = Gtk.CssProvider()
-        css_provider.load_from_data(css)
-        Gtk.StyleContext.add_provider_for_screen(
-            Gdk.Screen.get_default(),
-            css_provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-        )
+        if self.placeholder_image is None:
+            fallback_label = Gtk.Label(label="")
+            fallback_label.set_halign(Gtk.Align.CENTER)
+            fallback_label.set_valign(Gtk.Align.CENTER)
+            self.placeholder_inner.pack_start(fallback_label, True, True, 0)
+
+        self.placeholder_background.add_overlay(self.placeholder_label)
 
         self.video_overlay.add_overlay(self.placeholder_background)
         self.placeholder_background.show_all()
@@ -843,6 +896,8 @@ class UdpVideoWindow:
         alloc = self.video_overlay.get_allocation()
         self.update_placeholder_image_size(alloc.width, alloc.height)
 
+        self.ask_to_fix_udp_network_if_needed()
+
         self.poll_thread = threading.Thread(target=self.poll_mikrotik_loop, daemon=True)
         self.poll_thread.start()
 
@@ -854,6 +909,29 @@ class UdpVideoWindow:
 
         self.video_signal_thread = threading.Thread(target=self.video_signal_loop, daemon=True)
         self.video_signal_thread.start()
+
+    def apply_css(self):
+        css = b"""
+        #video-window, #video-root, #video-frame, #no-signal-bg {
+            background-color: #000000;
+        }
+
+        #no-signal-label {
+            color: white;
+            font-size: 28px;
+            font-weight: bold;
+            background-color: rgba(0, 0, 0, 0.45);
+            padding: 12px;
+            border-radius: 12px;
+        }
+        """
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
 
     def set_default_settings(self):
         self.enable_telemetry_osd = True
@@ -1090,14 +1168,13 @@ class UdpVideoWindow:
         if self.overlay is None:
             return
 
-        bg_value = self.overlay_background
         font_desc = f"Sans Bold {self.overlay_font_size}"
 
         GLib.idle_add(self.overlay.set_property, "xpad", self.overlay_xpad)
         GLib.idle_add(self.overlay.set_property, "ypad", self.overlay_ypad)
         GLib.idle_add(self.overlay.set_property, "halignment", self.overlay_halign)
         GLib.idle_add(self.overlay.set_property, "valignment", self.overlay_valign)
-        GLib.idle_add(self.overlay.set_property, "shaded-background", bg_value)
+        GLib.idle_add(self.overlay.set_property, "shaded-background", self.overlay_background)
         GLib.idle_add(self.overlay.set_property, "font-desc", font_desc)
 
     def refresh_video_area(self):
@@ -1185,6 +1262,12 @@ class UdpVideoWindow:
     def on_fullscreen_button_clicked(self, widget):
         GLib.idle_add(self.toggle_fullscreen_video)
 
+    def on_placeholder_button_press(self, widget, event):
+        if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:
+            GLib.idle_add(self.toggle_fullscreen_video)
+            return True
+        return False
+
     def on_key_press(self, widget, event):
         if event.keyval == Gdk.KEY_F11:
             GLib.idle_add(self.toggle_fullscreen_video)
@@ -1209,6 +1292,8 @@ class UdpVideoWindow:
 
         if self.is_video_fullscreen:
             self.top_bar.hide()
+            self.root.set_border_width(0)
+            self.root.set_spacing(0)
             self.frame_video.set_shadow_type(Gtk.ShadowType.NONE)
             self.window.fullscreen()
             self.btn_fullscreen.set_image(
@@ -1217,6 +1302,8 @@ class UdpVideoWindow:
             self.btn_fullscreen.set_tooltip_text("Вийти з повного екрана")
         else:
             self.window.unfullscreen()
+            self.root.set_border_width(self.default_root_border)
+            self.root.set_spacing(self.default_root_spacing)
             self.top_bar.show()
             self.frame_video.set_shadow_type(Gtk.ShadowType.IN)
             self.btn_fullscreen.set_image(
@@ -1640,23 +1727,17 @@ class UdpVideoWindow:
 
     def create_desktop_shortcut(self):
         try:
-            data_dir = get_user_data_dir()
             apps_dir = Path.home() / ".local" / "share" / "applications"
             icons_dir = Path.home() / ".local" / "share" / "icons" / "hicolor" / "256x256" / "apps"
-            install_dir = Path.home() / ".local" / "opt" / APP_ID
+            desktop_dir = get_desktop_dir()
 
-            data_dir.mkdir(parents=True, exist_ok=True)
             apps_dir.mkdir(parents=True, exist_ok=True)
             icons_dir.mkdir(parents=True, exist_ok=True)
-            install_dir.mkdir(parents=True, exist_ok=True)
+            desktop_dir.mkdir(parents=True, exist_ok=True)
 
             appimage_path = os.environ.get("APPIMAGE")
             if appimage_path:
-                src = Path(appimage_path)
-                target_exec = install_dir / f"{APP_ID}.AppImage"
-                shutil.copy2(src, target_exec)
-                target_exec.chmod(target_exec.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-                exec_line = str(target_exec)
+                exec_line = str(Path(appimage_path).resolve())
             else:
                 src = Path(__file__).resolve()
                 exec_line = f'python3 "{src}"'
@@ -1667,7 +1748,6 @@ class UdpVideoWindow:
                 icon_target = icons_dir / f"{icon_name}{icon_source.suffix.lower()}"
                 shutil.copy2(icon_source, icon_target)
 
-            desktop_file = apps_dir / f"{APP_ID}.desktop"
             desktop_content = f"""[Desktop Entry]
 Type=Application
 Name={APP_NAME}
@@ -1678,8 +1758,14 @@ Terminal=false
 Categories=Utility;Network;Video;
 StartupNotify=true
 """
-            desktop_file.write_text(desktop_content, encoding="utf-8")
-            desktop_file.chmod(desktop_file.stat().st_mode | stat.S_IXUSR)
+
+            menu_desktop_file = apps_dir / f"{APP_ID}.desktop"
+            menu_desktop_file.write_text(desktop_content, encoding="utf-8")
+            menu_desktop_file.chmod(menu_desktop_file.stat().st_mode | stat.S_IXUSR)
+
+            desktop_shortcut = desktop_dir / f"{APP_NAME}.desktop"
+            desktop_shortcut.write_text(desktop_content, encoding="utf-8")
+            desktop_shortcut.chmod(desktop_shortcut.stat().st_mode | stat.S_IXUSR)
 
             try:
                 subprocess.run(["update-desktop-database", str(apps_dir)], check=False)
@@ -1687,8 +1773,9 @@ StartupNotify=true
                 pass
 
             self.show_message(
-                "Ярлик створено",
-                f"Ярлик створено у:\n{desktop_file}",
+                "Ярлики створено",
+                f"Створено ярлик у меню:\n{menu_desktop_file}\n\n"
+                f"Створено ярлик на робочому столі:\n{desktop_shortcut}",
                 Gtk.MessageType.INFO,
             )
 
@@ -1698,6 +1785,124 @@ StartupNotify=true
                 str(e),
                 Gtk.MessageType.ERROR,
             )
+
+    def ask_to_fix_udp_network_if_needed(self):
+        if not self.bridge_remote_host:
+            return
+
+        try:
+            remote_ip = ipaddress.ip_address(self.bridge_remote_host)
+        except Exception:
+            return
+
+        if remote_ip.is_loopback:
+            return
+
+        interfaces = get_local_ipv4_interfaces()
+        if not interfaces:
+            return
+
+        matching = []
+        for item in interfaces:
+            try:
+                network = ipaddress.ip_network(item["network"], strict=False)
+                if remote_ip in network:
+                    matching.append(item)
+            except Exception:
+                continue
+
+        if matching:
+            return
+
+        dialog = Gtk.Dialog(
+            title="Невідповідність мережі",
+            transient_for=self.window,
+            flags=0,
+        )
+        dialog.add_button("Пропустити", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Застосувати", Gtk.ResponseType.OK)
+        dialog.set_default_size(520, 260)
+
+        box = dialog.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(12)
+
+        label = Gtk.Label(
+            label=(
+                "Поточний UDP host не належить жодній з локальних мереж.\n"
+                "Оберіть мережний інтерфейс і, за потреби, змініть UDP host."
+            )
+        )
+        label.set_xalign(0.0)
+        label.set_line_wrap(True)
+        box.pack_start(label, False, False, 0)
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(10)
+        grid.set_column_spacing(12)
+        box.pack_start(grid, False, False, 0)
+
+        combo_iface = Gtk.ComboBoxText()
+        for item in interfaces:
+            iface_id = f'{item["ifname"]}|{item["ip"]}|{item["network"]}'
+            iface_text = f'{item["ifname"]} | {item["ip"]} | {item["network"]}'
+            combo_iface.append(iface_id, iface_text)
+        combo_iface.set_active(0)
+
+        entry_host = Gtk.Entry()
+        entry_host.set_text(self.bridge_remote_host)
+
+        entry_bind_ip = Gtk.Entry()
+        entry_bind_ip.set_text(self.bridge_local_bind_ip)
+
+        grid.attach(Gtk.Label(label="Інтерфейс:"), 0, 0, 1, 1)
+        grid.attach(combo_iface, 1, 0, 1, 1)
+
+        grid.attach(Gtk.Label(label="UDP host:"), 0, 1, 1, 1)
+        grid.attach(entry_host, 1, 1, 1, 1)
+
+        grid.attach(Gtk.Label(label="Local bind IP:"), 0, 2, 1, 1)
+        grid.attach(entry_bind_ip, 1, 2, 1, 1)
+
+        def on_iface_changed(widget):
+            iface_data = combo_iface.get_active_id()
+            if not iface_data:
+                return
+
+            _, iface_ip, iface_network = iface_data.split("|", 2)
+            entry_bind_ip.set_text(iface_ip)
+
+            try:
+                net = ipaddress.ip_network(iface_network, strict=False)
+                current_host = entry_host.get_text().strip()
+                try:
+                    current_ip = ipaddress.ip_address(current_host)
+                    if current_ip in net:
+                        return
+                except Exception:
+                    pass
+
+                if net.prefixlen <= 24:
+                    hosts = list(net.hosts())
+                    if hosts:
+                        suggested = str(hosts[min(49, len(hosts) - 1)])
+                        entry_host.set_text(suggested)
+            except Exception:
+                pass
+
+        combo_iface.connect("changed", on_iface_changed)
+        on_iface_changed(combo_iface)
+
+        dialog.show_all()
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            self.bridge_remote_host = entry_host.get_text().strip()
+            self.bridge_local_bind_ip = entry_bind_ip.get_text().strip() or "0.0.0.0"
+            self.save_settings()
+            self.restart_bridge()
+
+        dialog.destroy()
 
     def make_section(self, title: str) -> Tuple[Gtk.Frame, Gtk.Grid]:
         frame = Gtk.Frame(label=title)
@@ -1730,10 +1935,7 @@ StartupNotify=true
         dialog.set_default_size(780, 720)
         dialog.set_resizable(True)
 
-        btn_shortcut = dialog.add_button("Створити ярлик", 2)
-        btn_shortcut.set_sensitive(False)
-        btn_shortcut.set_tooltip_text("У цій версії кнопка тимчасово вимкнена")
-
+        dialog.add_button("Створити ярлик", 2)
         dialog.add_button("Скинути", 1)
         dialog.add_button("Скасувати", Gtk.ResponseType.CANCEL)
         dialog.add_button("Застосувати", Gtk.ResponseType.OK)
@@ -2021,6 +2223,7 @@ StartupNotify=true
                 continue
 
             if response == 2:
+                self.create_desktop_shortcut()
                 continue
 
             if response == Gtk.ResponseType.OK:
@@ -2118,6 +2321,7 @@ StartupNotify=true
 
                 if bridge_changed:
                     self.restart_bridge()
+                    self.ask_to_fix_udp_network_if_needed()
 
                 if self.enable_telemetry_osd:
                     if mikrotik_changed or (prev_enable_telemetry_osd != self.enable_telemetry_osd):

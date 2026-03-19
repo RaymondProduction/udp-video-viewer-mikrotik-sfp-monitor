@@ -27,7 +27,7 @@ from gi.repository import Gtk, Gst, GLib, Gdk, GdkPixbuf
 Gst.init(None)
 
 APP_VERSION = "0.1 beta"
-APP_NAME = "Наземна станція для Принц Вандам Галицький"
+APP_NAME = "Принц Вандам Галицький"
 APP_ID = "knyaz-vandam-ground-station"
 
 
@@ -766,6 +766,7 @@ class UdpVideoWindow:
 
         self.default_root_border = 8
         self.default_root_spacing = 6
+        self.network_warning_shown = False
 
         self.mt_client: Optional[MikroTikSshClient] = None
         self.mt_lock = threading.Lock()
@@ -786,6 +787,7 @@ class UdpVideoWindow:
         self.window.connect("key-press-event", self.on_key_press)
 
         self.apply_css()
+        self.apply_window_icon()
 
         self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=self.default_root_spacing)
         self.root.set_name("video-root")
@@ -850,7 +852,8 @@ class UdpVideoWindow:
         self.placeholder_label = Gtk.Label(label="Немає сигналу з дроном")
         self.placeholder_label.set_name("no-signal-label")
         self.placeholder_label.set_halign(Gtk.Align.CENTER)
-        self.placeholder_label.set_valign(Gtk.Align.CENTER)
+        self.placeholder_label.set_valign(Gtk.Align.END)
+        self.placeholder_label.set_margin_bottom(32)
         self.placeholder_label.set_justify(Gtk.Justification.CENTER)
         self.placeholder_label.set_line_wrap(True)
 
@@ -896,7 +899,7 @@ class UdpVideoWindow:
         alloc = self.video_overlay.get_allocation()
         self.update_placeholder_image_size(alloc.width, alloc.height)
 
-        self.ask_to_fix_udp_network_if_needed()
+        GLib.idle_add(self.warn_udp_network_mismatch_if_needed)
 
         self.poll_thread = threading.Thread(target=self.poll_mikrotik_loop, daemon=True)
         self.poll_thread.start()
@@ -932,6 +935,15 @@ class UdpVideoWindow:
             css_provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
+
+    def apply_window_icon(self):
+        icon_source = self.find_icon_source()
+        if icon_source is None:
+            return
+        try:
+            self.window.set_icon_from_file(str(icon_source))
+        except Exception as e:
+            print(f"[WARN] Не вдалося встановити іконку вікна: {e}", file=sys.stderr)
 
     def set_default_settings(self):
         self.enable_telemetry_osd = True
@@ -1682,6 +1694,45 @@ class UdpVideoWindow:
                 print(f"[WARN] bridge_info_loop: {e}", file=sys.stderr)
             time.sleep(1.0)
 
+    def warn_udp_network_mismatch_if_needed(self):
+        if self.network_warning_shown:
+            return False
+
+        if not self.bridge_remote_host:
+            return False
+
+        try:
+            remote_ip = ipaddress.ip_address(self.bridge_remote_host)
+        except Exception:
+            return False
+
+        if remote_ip.is_loopback:
+            return False
+
+        interfaces = get_local_ipv4_interfaces()
+        if not interfaces:
+            return False
+
+        for item in interfaces:
+            try:
+                network = ipaddress.ip_network(item["network"], strict=False)
+                if remote_ip in network:
+                    return False
+            except Exception:
+                continue
+
+        self.network_warning_shown = True
+        self.show_message(
+            "Попередження про мережу",
+            (
+                f"UDP віддалений host ({self.bridge_remote_host}) не входить у жодну локальну мережу.\n\n"
+                "Перевірте налаштування IP та переконайтеся, що вони співпадають з мережею "
+                "вашого мережного інтерфейсу."
+            ),
+            Gtk.MessageType.WARNING,
+        )
+        return False
+
     def on_bus_message(self, bus, message):
         msg_type = message.type
 
@@ -1742,18 +1793,45 @@ class UdpVideoWindow:
                 src = Path(__file__).resolve()
                 exec_line = f'python3 "{src}"'
 
-            icon_name = APP_ID
             icon_source = self.find_icon_source()
+            icon_line = ""
             if icon_source is not None:
-                icon_target = icons_dir / f"{icon_name}{icon_source.suffix.lower()}"
+                icon_target = icons_dir / "prince_ground_station.png"
                 shutil.copy2(icon_source, icon_target)
+                icon_line = str(icon_target.resolve())
+
+                try:
+                    subprocess.run(
+                        ["gtk-update-icon-cache", "-f", "-t", str(icons_dir.parent)],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    subprocess.run(
+                        ["update-desktop-database", str(apps_dir)],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+            else:
+                self.show_message(
+                    "Попередження",
+                    "Файл іконки не знайдено. Ярлик буде створено без красивої іконки.",
+                    Gtk.MessageType.WARNING,
+                )
 
             desktop_content = f"""[Desktop Entry]
 Type=Application
 Name={APP_NAME}
 Comment={APP_NAME}
 Exec={exec_line}
-Icon={icon_name}
+Icon={icon_line}
 Terminal=false
 Categories=Utility;Network;Video;
 StartupNotify=true
@@ -1766,11 +1844,6 @@ StartupNotify=true
             desktop_shortcut = desktop_dir / f"{APP_NAME}.desktop"
             desktop_shortcut.write_text(desktop_content, encoding="utf-8")
             desktop_shortcut.chmod(desktop_shortcut.stat().st_mode | stat.S_IXUSR)
-
-            try:
-                subprocess.run(["update-desktop-database", str(apps_dir)], check=False)
-            except Exception:
-                pass
 
             self.show_message(
                 "Ярлики створено",
@@ -1786,123 +1859,123 @@ StartupNotify=true
                 Gtk.MessageType.ERROR,
             )
 
-    def ask_to_fix_udp_network_if_needed(self):
-        if not self.bridge_remote_host:
-            return
+    # def ask_to_fix_udp_network_if_needed(self):
+    #     if not self.bridge_remote_host:
+    #         return
 
-        try:
-            remote_ip = ipaddress.ip_address(self.bridge_remote_host)
-        except Exception:
-            return
+    #     try:
+    #         remote_ip = ipaddress.ip_address(self.bridge_remote_host)
+    #     except Exception:
+    #         return
 
-        if remote_ip.is_loopback:
-            return
+    #     if remote_ip.is_loopback:
+    #         return
 
-        interfaces = get_local_ipv4_interfaces()
-        if not interfaces:
-            return
+    #     interfaces = get_local_ipv4_interfaces()
+    #     if not interfaces:
+    #         return
 
-        matching = []
-        for item in interfaces:
-            try:
-                network = ipaddress.ip_network(item["network"], strict=False)
-                if remote_ip in network:
-                    matching.append(item)
-            except Exception:
-                continue
+    #     matching = []
+    #     for item in interfaces:
+    #         try:
+    #             network = ipaddress.ip_network(item["network"], strict=False)
+    #             if remote_ip in network:
+    #                 matching.append(item)
+    #         except Exception:
+    #             continue
 
-        if matching:
-            return
+    #     if matching:
+    #         return
 
-        dialog = Gtk.Dialog(
-            title="Невідповідність мережі",
-            transient_for=self.window,
-            flags=0,
-        )
-        dialog.add_button("Пропустити", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Застосувати", Gtk.ResponseType.OK)
-        dialog.set_default_size(520, 260)
+    #     dialog = Gtk.Dialog(
+    #         title="Невідповідність мережі",
+    #         transient_for=self.window,
+    #         flags=0,
+    #     )
+    #     dialog.add_button("Пропустити", Gtk.ResponseType.CANCEL)
+    #     dialog.add_button("Застосувати", Gtk.ResponseType.OK)
+    #     dialog.set_default_size(520, 260)
 
-        box = dialog.get_content_area()
-        box.set_spacing(10)
-        box.set_border_width(12)
+    #     box = dialog.get_content_area()
+    #     box.set_spacing(10)
+    #     box.set_border_width(12)
 
-        label = Gtk.Label(
-            label=(
-                "Поточний UDP host не належить жодній з локальних мереж.\n"
-                "Оберіть мережний інтерфейс і, за потреби, змініть UDP host."
-            )
-        )
-        label.set_xalign(0.0)
-        label.set_line_wrap(True)
-        box.pack_start(label, False, False, 0)
+    #     label = Gtk.Label(
+    #         label=(
+    #             "Поточний UDP host не належить жодній з локальних мереж.\n"
+    #             "Оберіть мережний інтерфейс і, за потреби, змініть UDP host."
+    #         )
+    #     )
+    #     label.set_xalign(0.0)
+    #     label.set_line_wrap(True)
+    #     box.pack_start(label, False, False, 0)
 
-        grid = Gtk.Grid()
-        grid.set_row_spacing(10)
-        grid.set_column_spacing(12)
-        box.pack_start(grid, False, False, 0)
+    #     grid = Gtk.Grid()
+    #     grid.set_row_spacing(10)
+    #     grid.set_column_spacing(12)
+    #     box.pack_start(grid, False, False, 0)
 
-        combo_iface = Gtk.ComboBoxText()
-        for item in interfaces:
-            iface_id = f'{item["ifname"]}|{item["ip"]}|{item["network"]}'
-            iface_text = f'{item["ifname"]} | {item["ip"]} | {item["network"]}'
-            combo_iface.append(iface_id, iface_text)
-        combo_iface.set_active(0)
+    #     combo_iface = Gtk.ComboBoxText()
+    #     for item in interfaces:
+    #         iface_id = f'{item["ifname"]}|{item["ip"]}|{item["network"]}'
+    #         iface_text = f'{item["ifname"]} | {item["ip"]} | {item["network"]}'
+    #         combo_iface.append(iface_id, iface_text)
+    #     combo_iface.set_active(0)
 
-        entry_host = Gtk.Entry()
-        entry_host.set_text(self.bridge_remote_host)
+    #     entry_host = Gtk.Entry()
+    #     entry_host.set_text(self.bridge_remote_host)
 
-        entry_bind_ip = Gtk.Entry()
-        entry_bind_ip.set_text(self.bridge_local_bind_ip)
+    #     entry_bind_ip = Gtk.Entry()
+    #     entry_bind_ip.set_text(self.bridge_local_bind_ip)
 
-        grid.attach(Gtk.Label(label="Інтерфейс:"), 0, 0, 1, 1)
-        grid.attach(combo_iface, 1, 0, 1, 1)
+    #     grid.attach(Gtk.Label(label="Інтерфейс:"), 0, 0, 1, 1)
+    #     grid.attach(combo_iface, 1, 0, 1, 1)
 
-        grid.attach(Gtk.Label(label="UDP host:"), 0, 1, 1, 1)
-        grid.attach(entry_host, 1, 1, 1, 1)
+    #     grid.attach(Gtk.Label(label="UDP host:"), 0, 1, 1, 1)
+    #     grid.attach(entry_host, 1, 1, 1, 1)
 
-        grid.attach(Gtk.Label(label="Local bind IP:"), 0, 2, 1, 1)
-        grid.attach(entry_bind_ip, 1, 2, 1, 1)
+    #     grid.attach(Gtk.Label(label="Local bind IP:"), 0, 2, 1, 1)
+    #     grid.attach(entry_bind_ip, 1, 2, 1, 1)
 
-        def on_iface_changed(widget):
-            iface_data = combo_iface.get_active_id()
-            if not iface_data:
-                return
+    #     def on_iface_changed(widget):
+    #         iface_data = combo_iface.get_active_id()
+    #         if not iface_data:
+    #             return
 
-            _, iface_ip, iface_network = iface_data.split("|", 2)
-            entry_bind_ip.set_text(iface_ip)
+    #         _, iface_ip, iface_network = iface_data.split("|", 2)
+    #         entry_bind_ip.set_text(iface_ip)
 
-            try:
-                net = ipaddress.ip_network(iface_network, strict=False)
-                current_host = entry_host.get_text().strip()
-                try:
-                    current_ip = ipaddress.ip_address(current_host)
-                    if current_ip in net:
-                        return
-                except Exception:
-                    pass
+    #         try:
+    #             net = ipaddress.ip_network(iface_network, strict=False)
+    #             current_host = entry_host.get_text().strip()
+    #             try:
+    #                 current_ip = ipaddress.ip_address(current_host)
+    #                 if current_ip in net:
+    #                     return
+    #             except Exception:
+    #                 pass
 
-                if net.prefixlen <= 24:
-                    hosts = list(net.hosts())
-                    if hosts:
-                        suggested = str(hosts[min(49, len(hosts) - 1)])
-                        entry_host.set_text(suggested)
-            except Exception:
-                pass
+    #             if net.prefixlen <= 24:
+    #                 hosts = list(net.hosts())
+    #                 if hosts:
+    #                     suggested = str(hosts[min(49, len(hosts) - 1)])
+    #                     entry_host.set_text(suggested)
+    #         except Exception:
+    #             pass
 
-        combo_iface.connect("changed", on_iface_changed)
-        on_iface_changed(combo_iface)
+    #     combo_iface.connect("changed", on_iface_changed)
+    #     on_iface_changed(combo_iface)
 
-        dialog.show_all()
-        response = dialog.run()
+    #     dialog.show_all()
+    #     response = dialog.run()
 
-        if response == Gtk.ResponseType.OK:
-            self.bridge_remote_host = entry_host.get_text().strip()
-            self.bridge_local_bind_ip = entry_bind_ip.get_text().strip() or "0.0.0.0"
-            self.save_settings()
-            self.restart_bridge()
+    #     if response == Gtk.ResponseType.OK:
+    #         self.bridge_remote_host = entry_host.get_text().strip()
+    #         self.bridge_local_bind_ip = entry_bind_ip.get_text().strip() or "0.0.0.0"
+    #         self.save_settings()
+    #         self.restart_bridge()
 
-        dialog.destroy()
+    #     dialog.destroy()
 
     def make_section(self, title: str) -> Tuple[Gtk.Frame, Gtk.Grid]:
         frame = Gtk.Frame(label=title)
@@ -2321,7 +2394,8 @@ StartupNotify=true
 
                 if bridge_changed:
                     self.restart_bridge()
-                    self.ask_to_fix_udp_network_if_needed()
+                    self.network_warning_shown = False
+                    GLib.idle_add(self.warn_udp_network_mismatch_if_needed)
 
                 if self.enable_telemetry_osd:
                     if mikrotik_changed or (prev_enable_telemetry_osd != self.enable_telemetry_osd):

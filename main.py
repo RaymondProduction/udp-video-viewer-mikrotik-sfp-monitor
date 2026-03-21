@@ -974,6 +974,7 @@ class UdpVideoWindow:
         self.overlay_valign = "bottom"
 
         self.show_loss = True
+        self.show_rx_power = False
         self.show_distance = True
         self.show_wavelength = True
 
@@ -1020,6 +1021,7 @@ class UdpVideoWindow:
                 self.overlay_valign = valign
 
             self.show_loss = bool(osd.get("show_loss", self.show_loss))
+            self.show_rx_power = bool(osd.get("show_rx_power", self.show_rx_power))
             self.show_distance = bool(osd.get("show_distance", self.show_distance))
             self.show_wavelength = bool(osd.get("show_wavelength", self.show_wavelength))
 
@@ -1064,6 +1066,7 @@ class UdpVideoWindow:
                 "halign": self.overlay_halign,
                 "valign": self.overlay_valign,
                 "show_loss": self.show_loss,
+                "show_rx_power": self.show_rx_power,
                 "show_distance": self.show_distance,
                 "show_wavelength": self.show_wavelength,
             },
@@ -1355,12 +1358,17 @@ class UdpVideoWindow:
         GLib.idle_add(self.refresh_video_area)
         return False
 
-    def set_overlay_text(self, text: str):
-        if self.overlay is not None:
-            GLib.idle_add(self.overlay.set_property, "text", text)
+    def set_overlay_text(self, text: str, force: bool = False):
+        if self.overlay is None:
+            return
+
+        if not force and not self.enable_telemetry_osd:
+            text = ""
+
+        GLib.idle_add(self.overlay.set_property, "text", text)
 
     def clear_overlay_text(self):
-        self.set_overlay_text("")
+        self.set_overlay_text("", force=True)
 
     def restart_video_pipeline(self):
         old_text = ""
@@ -1391,7 +1399,7 @@ class UdpVideoWindow:
         new_text = old_text
         if not self.enable_telemetry_osd:
             new_text = ""
-        if not new_text:
+        if not new_text and self.enable_telemetry_osd:
             new_text = self.get_overlay_text_for_pipeline_start()
 
         self.build_and_start_pipeline(new_text)
@@ -1502,6 +1510,10 @@ class UdpVideoWindow:
                 loss_text = f"{(tx_val - rx_val):.2f} dB"
             lines.append(f"LOSS: {loss_text}")
 
+        if self.show_rx_power:
+            rx_text = rx_power.strip() if rx_power else "N/A"
+            lines.append(f"RX: {rx_text}")
+
         wl_dist = []
         if self.show_wavelength and wavelength:
             wl_dist.append(f"WL: {wavelength}")
@@ -1566,6 +1578,7 @@ class UdpVideoWindow:
         while self.running:
             try:
                 if not self.enable_telemetry_osd:
+                    self.clear_overlay_text()
                     time.sleep(self.poll_interval)
                     continue
 
@@ -1952,13 +1965,17 @@ StartupWMClass={APP_ID}
         chk_show_loss.set_active(self.show_loss)
         grid_data.attach(chk_show_loss, 0, 0, 2, 1)
 
+        chk_show_rx_power = Gtk.CheckButton(label="Показувати RX power")
+        chk_show_rx_power.set_active(self.show_rx_power)
+        grid_data.attach(chk_show_rx_power, 0, 1, 2, 1)
+
         chk_show_distance = Gtk.CheckButton(label="Показувати максимальну дистанцію SFP")
         chk_show_distance.set_active(self.show_distance)
-        grid_data.attach(chk_show_distance, 0, 1, 2, 1)
+        grid_data.attach(chk_show_distance, 0, 2, 2, 1)
 
         chk_show_wavelength = Gtk.CheckButton(label="Показувати довжину хвилі SFP")
         chk_show_wavelength.set_active(self.show_wavelength)
-        grid_data.attach(chk_show_wavelength, 0, 2, 2, 1)
+        grid_data.attach(chk_show_wavelength, 0, 3, 2, 1)
 
         osd_page.pack_start(info_frame, False, False, 0)
         osd_page.pack_start(frame_show, False, False, 0)
@@ -2111,6 +2128,7 @@ StartupWMClass={APP_ID}
             combo_halign.set_sensitive(enabled)
             combo_valign.set_sensitive(enabled)
             chk_show_loss.set_sensitive(enabled)
+            chk_show_rx_power.set_sensitive(enabled)
             chk_show_distance.set_sensitive(enabled)
             chk_show_wavelength.set_sensitive(enabled)
 
@@ -2131,6 +2149,7 @@ StartupWMClass={APP_ID}
             combo_halign.set_active_id("right")
             combo_valign.set_active_id("bottom")
             chk_show_loss.set_active(True)
+            chk_show_rx_power.set_active(False)
             chk_show_distance.set_active(True)
             chk_show_wavelength.set_active(True)
 
@@ -2200,6 +2219,7 @@ StartupWMClass={APP_ID}
                 self.overlay_halign = combo_halign.get_active_id() or "right"
                 self.overlay_valign = combo_valign.get_active_id() or "bottom"
                 self.show_loss = chk_show_loss.get_active()
+                self.show_rx_power = chk_show_rx_power.get_active()
                 self.show_distance = chk_show_distance.get_active()
                 self.show_wavelength = chk_show_wavelength.get_active()
 
@@ -2227,7 +2247,11 @@ StartupWMClass={APP_ID}
                 self.save_settings()
                 self.window.set_keep_above(self.always_on_top)
 
-                video_pipeline_changed = (self.port != prev_video_port) or (self.mode != prev_video_mode)
+                video_pipeline_changed = (
+                    (self.port != prev_video_port)
+                    or (self.mode != prev_video_mode)
+                    or (prev_enable_telemetry_osd != self.enable_telemetry_osd)
+                )
 
                 bridge_state = (
                     self.serial_dev,
@@ -2249,6 +2273,9 @@ StartupWMClass={APP_ID}
                 )
                 mikrotik_changed = mikrotik_state != prev_mikrotik_state
 
+                if not self.enable_telemetry_osd:
+                    self.disable_mikrotik_runtime()
+
                 if video_pipeline_changed:
                     self.restart_video_pipeline()
                 else:
@@ -2267,9 +2294,6 @@ StartupWMClass={APP_ID}
                 if self.enable_telemetry_osd:
                     if mikrotik_changed or (prev_enable_telemetry_osd != self.enable_telemetry_osd):
                         self.request_mikrotik_reconnect()
-                else:
-                    if prev_enable_telemetry_osd:
-                        self.disable_mikrotik_runtime()
 
             break
 

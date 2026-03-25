@@ -972,6 +972,7 @@ class UdpVideoWindow:
         self.overlay_background = False
         self.overlay_halign = "right"
         self.overlay_valign = "bottom"
+        self.overlay_color = 0xFFFFFFFF
 
         self.show_loss = True
         self.show_rx_power = False
@@ -1197,6 +1198,45 @@ class UdpVideoWindow:
     def escape_gst_text(text: str) -> str:
         return text.replace("\\", "\\\\").replace('"', '\\"')
 
+    @staticmethod
+    def make_argb(a: int, r: int, g: int, b: int) -> int:
+        return ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF)
+
+    def get_overlay_color_by_metrics(
+        self,
+        rx_power: Optional[str],
+        tx_power: Optional[str],
+        error_text: Optional[str] = None,
+    ) -> int:
+        if error_text:
+            return self.make_argb(255, 255, 64, 64)
+
+        rx_val = parse_dbm_value(rx_power)
+        tx_val = parse_dbm_value(tx_power)
+
+        if tx_val is not None and rx_val is not None:
+            loss_val = tx_val - rx_val
+            if loss_val <= 10.0:
+                return self.make_argb(255, 64, 255, 64)
+            if loss_val <= 15.0:
+                return self.make_argb(255, 255, 220, 64)
+            return self.make_argb(255, 255, 64, 64)
+
+        if rx_val is not None:
+            if rx_val >= -10.0:
+                return self.make_argb(255, 64, 255, 64)
+            if rx_val >= -15.0:
+                return self.make_argb(255, 255, 220, 64)
+            return self.make_argb(255, 255, 64, 64)
+
+        return self.make_argb(255, 255, 255, 255)
+
+    def set_overlay_color(self, color: int):
+        self.overlay_color = color
+        if self.overlay is None:
+            return
+        GLib.idle_add(self.overlay.set_property, "color", color)
+
     def apply_overlay_visual_settings(self):
         if self.overlay is None:
             return
@@ -1209,6 +1249,7 @@ class UdpVideoWindow:
         GLib.idle_add(self.overlay.set_property, "valignment", self.overlay_valign)
         GLib.idle_add(self.overlay.set_property, "shaded-background", self.overlay_background)
         GLib.idle_add(self.overlay.set_property, "font-desc", font_desc)
+        GLib.idle_add(self.overlay.set_property, "color", self.overlay_color)
 
     def refresh_video_area(self):
         self.video_overlay.queue_draw()
@@ -1358,9 +1399,12 @@ class UdpVideoWindow:
         GLib.idle_add(self.refresh_video_area)
         return False
 
-    def set_overlay_text(self, text: str, force: bool = False):
+    def set_overlay_text(self, text: str, force: bool = False, color: Optional[int] = None):
         if self.overlay is None:
             return
+
+        if color is not None:
+            self.set_overlay_color(color)
 
         if not force and not self.enable_telemetry_osd:
             text = ""
@@ -1368,7 +1412,7 @@ class UdpVideoWindow:
         GLib.idle_add(self.overlay.set_property, "text", text)
 
     def clear_overlay_text(self):
-        self.set_overlay_text("", force=True)
+        self.set_overlay_text("", force=True, color=self.make_argb(255, 255, 255, 255))
 
     def restart_video_pipeline(self):
         old_text = ""
@@ -1438,6 +1482,7 @@ class UdpVideoWindow:
             self.mikrotik_reconnect_requested = False
 
         self.clear_overlay_text()
+        self.set_overlay_color(self.make_argb(255, 255, 255, 255))
 
     def request_mikrotik_reconnect(self):
         with self.mt_lock:
@@ -1451,7 +1496,10 @@ class UdpVideoWindow:
             self.mikrotik_reconnect_requested = True
 
         if self.enable_telemetry_osd:
-            self.set_overlay_text("STATUS: Перепідключення до MikroTik...")
+            self.set_overlay_text(
+                "STATUS: Перепідключення до MikroTik...",
+                color=self.make_argb(255, 255, 220, 64),
+            )
         else:
             self.clear_overlay_text()
 
@@ -1498,11 +1546,14 @@ class UdpVideoWindow:
         lines = []
 
         if error_text:
+            self.set_overlay_color(self.get_overlay_color_by_metrics(rx_power, tx_power, error_text))
             lines.append(f"STATUS: {error_text}")
             return "\n".join(lines)
 
         rx_val = parse_dbm_value(rx_power)
         tx_val = parse_dbm_value(tx_power)
+
+        self.set_overlay_color(self.get_overlay_color_by_metrics(rx_power, tx_power))
 
         if self.show_loss:
             loss_text = "N/A"
@@ -1530,14 +1581,20 @@ class UdpVideoWindow:
             return False
 
         if not self.mikrotik_host:
-            self.set_overlay_text("STATUS: Пошук MikroTik через SSH...")
+            self.set_overlay_text(
+                "STATUS: Пошук MikroTik через SSH...",
+                color=self.make_argb(255, 255, 220, 64),
+            )
             found = auto_discover_mikrotik(
                 username=self.mikrotik_user,
                 password=self.mikrotik_password,
                 port=self.ssh_port,
             )
             if not found:
-                self.set_overlay_text("STATUS: MikroTik не знайдено")
+                self.set_overlay_text(
+                    "STATUS: MikroTik не знайдено",
+                    color=self.make_argb(255, 255, 64, 64),
+                )
                 return False
             self.mikrotik_host = found
 
@@ -1552,11 +1609,17 @@ class UdpVideoWindow:
         identity = client.get_identity() or ""
 
         if not self.mikrotik_interface:
-            self.set_overlay_text("STATUS: Пошук SFP інтерфейсу...")
+            self.set_overlay_text(
+                "STATUS: Пошук SFP інтерфейсу...",
+                color=self.make_argb(255, 255, 220, 64),
+            )
             found_if = client.auto_discover_sfp_interface()
             if not found_if:
                 client.disconnect()
-                self.set_overlay_text("STATUS: SFP інтерфейс не знайдено")
+                self.set_overlay_text(
+                    "STATUS: SFP інтерфейс не знайдено",
+                    color=self.make_argb(255, 255, 64, 64),
+                )
                 return False
             self.mikrotik_interface = found_if
 
@@ -1578,7 +1641,6 @@ class UdpVideoWindow:
         while self.running:
             try:
                 if not self.enable_telemetry_osd:
-                    self.clear_overlay_text()
                     time.sleep(self.poll_interval)
                     continue
 
@@ -1636,7 +1698,10 @@ class UdpVideoWindow:
                 time.sleep(self.poll_interval)
 
             except Exception as e:
-                self.set_overlay_text(f"STATUS: INIT ERROR: {type(e).__name__}")
+                self.set_overlay_text(
+                    f"STATUS: INIT ERROR: {type(e).__name__}",
+                    color=self.make_argb(255, 255, 64, 64),
+                )
                 print(f"Init error: {e}", file=sys.stderr)
                 time.sleep(self.poll_interval)
 
@@ -2250,7 +2315,6 @@ StartupWMClass={APP_ID}
                 video_pipeline_changed = (
                     (self.port != prev_video_port)
                     or (self.mode != prev_video_mode)
-                    or (prev_enable_telemetry_osd != self.enable_telemetry_osd)
                 )
 
                 bridge_state = (
@@ -2282,7 +2346,10 @@ StartupWMClass={APP_ID}
                     self.apply_overlay_visual_settings()
                     if self.enable_telemetry_osd:
                         if not prev_enable_telemetry_osd:
-                            self.set_overlay_text("STATUS: Підключення до MikroTik...")
+                            self.set_overlay_text(
+                                "STATUS: Підключення до MikroTik...",
+                                color=self.make_argb(255, 255, 220, 64),
+                            )
                         GLib.idle_add(self.refresh_video_area)
                     else:
                         self.clear_overlay_text()

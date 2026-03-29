@@ -974,8 +974,8 @@ class UdpVideoWindow:
         self.overlay_valign = "bottom"
         self.overlay_color = 0xFFFFFFFF
 
-        self.show_loss = True
-        self.show_rx_power = False
+        self.show_loss = False
+        self.show_rx_power = True
         self.show_distance = True
         self.show_wavelength = True
 
@@ -2026,21 +2026,21 @@ StartupWMClass={APP_ID}
         self.add_labeled_row(grid_style, 3, "Вертикально:", combo_valign)
 
         frame_data, grid_data = self.make_section("Що показувати")
-        chk_show_loss = Gtk.CheckButton(label="Показувати затухання")
-        chk_show_loss.set_active(self.show_loss)
-        grid_data.attach(chk_show_loss, 0, 0, 2, 1)
-
         chk_show_rx_power = Gtk.CheckButton(label="Показувати RX power")
         chk_show_rx_power.set_active(self.show_rx_power)
-        grid_data.attach(chk_show_rx_power, 0, 1, 2, 1)
+        grid_data.attach(chk_show_rx_power, 0, 0, 2, 1)
 
         chk_show_distance = Gtk.CheckButton(label="Показувати максимальну дистанцію SFP")
         chk_show_distance.set_active(self.show_distance)
-        grid_data.attach(chk_show_distance, 0, 2, 2, 1)
+        grid_data.attach(chk_show_distance, 0, 1, 2, 1)
 
         chk_show_wavelength = Gtk.CheckButton(label="Показувати довжину хвилі SFP")
         chk_show_wavelength.set_active(self.show_wavelength)
-        grid_data.attach(chk_show_wavelength, 0, 3, 2, 1)
+        grid_data.attach(chk_show_wavelength, 0, 2, 2, 1)
+
+        chk_show_loss = Gtk.CheckButton(label="Показувати затухання (різниця між TX power та RX power у dB)")
+        chk_show_loss.set_active(self.show_loss)
+        grid_data.attach(chk_show_loss, 0, 3, 2, 1)
 
         osd_page.pack_start(info_frame, False, False, 0)
         osd_page.pack_start(frame_show, False, False, 0)
@@ -2213,10 +2213,10 @@ StartupWMClass={APP_ID}
             chk_bg.set_active(False)
             combo_halign.set_active_id("right")
             combo_valign.set_active_id("bottom")
-            chk_show_loss.set_active(True)
-            chk_show_rx_power.set_active(False)
+            chk_show_rx_power.set_active(True)
             chk_show_distance.set_active(True)
             chk_show_wavelength.set_active(True)
+            chk_show_loss.set_active(False)
 
             combo_serial_dev.set_active_id("__auto__")
             spin_serial_baud.set_value(420000)

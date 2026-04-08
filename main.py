@@ -11,6 +11,10 @@ import subprocess
 import sys
 import threading
 import time
+import base64
+import urllib.parse
+import urllib.request
+import ssl
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -732,6 +736,12 @@ class UdpVideoWindow:
 
         self.placeholder_image_shown_once = False
 
+        self.majestic_restart_lock = threading.Lock()
+        self.majestic_restart_in_progress = False
+        self.majestic_restart_last_time = 0.0
+        self.majestic_restart_debounce_sec = 3.0
+        self.btn_restart_mj = None
+
         self.load_settings()
 
         self.window = Gtk.Window(title=APP_NAME)
@@ -758,6 +768,11 @@ class UdpVideoWindow:
         self.btn_fullscreen.set_tooltip_text("На весь екран")
         self.btn_fullscreen.connect("clicked", self.on_fullscreen_button_clicked)
         self.top_bar.pack_start(self.btn_fullscreen, False, False, 0)
+
+        self.btn_restart_mj = Gtk.Button(label="Restart MJ")
+        self.btn_restart_mj.set_tooltip_text("Перезапуск Majestic")
+        self.btn_restart_mj.connect("clicked", self.on_restart_majestic_clicked)
+        self.top_bar.pack_start(self.btn_restart_mj, False, False, 0)
 
         btn_settings = Gtk.Button()
         btn_settings.set_image(Gtk.Image.new_from_icon_name("emblem-system-symbolic", Gtk.IconSize.BUTTON))
@@ -1346,6 +1361,81 @@ class UdpVideoWindow:
 
     def on_fullscreen_button_clicked(self, widget):
         GLib.idle_add(self.toggle_fullscreen_video)
+
+    def on_restart_majestic_clicked(self, widget):
+        self.restart_majestic()
+
+    def set_restart_majestic_button_enabled(self, enabled: bool):
+        if self.btn_restart_mj is not None:
+            self.btn_restart_mj.set_sensitive(enabled)
+        return False
+
+    def finish_restart_majestic_request(self):
+        with self.majestic_restart_lock:
+            self.majestic_restart_in_progress = False
+            self.majestic_restart_last_time = time.time()
+
+        GLib.idle_add(self.set_restart_majestic_button_enabled, False)
+        GLib.timeout_add(int(self.majestic_restart_debounce_sec * 1000), self.set_restart_majestic_button_enabled, True)
+        return False
+
+    def restart_majestic(self):
+        with self.majestic_restart_lock:
+            now = time.time()
+
+            if self.majestic_restart_in_progress:
+                print("[INFO] Majestic restart already in progress", flush=True)
+                return
+
+            if now - self.majestic_restart_last_time < self.majestic_restart_debounce_sec:
+                print("[INFO] Majestic restart debounce: click ignored", flush=True)
+                return
+
+            self.majestic_restart_in_progress = True
+
+        host = (self.bridge_remote_host or "").strip()
+        if not host:
+            with self.majestic_restart_lock:
+                self.majestic_restart_in_progress = False
+            print("[ERROR] Majestic restart failed: bridge_remote_host is empty", file=sys.stderr)
+            return
+
+        GLib.idle_add(self.set_restart_majestic_button_enabled, False)
+
+        def worker():
+            try:
+                user = "root"
+                password = "putin_HUILO"
+
+                auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+                url = f"http://{host}/cgi-bin/mj-settings.cgi"
+                data = urllib.parse.urlencode({"action": "restart"}).encode("utf-8")
+
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    method="POST",
+                    headers = {
+                        "Authorization": f"Basic {auth}",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                )
+
+                context = ssl._create_unverified_context()
+
+                with urllib.request.urlopen(req, timeout=5, context=context) as resp:
+                    body = resp.read().decode("utf-8", errors="ignore")
+                    print(f"[INFO] Majestic restart sent to {host}, HTTP {resp.status}", flush=True)
+                    if body:
+                        print(f"[INFO] Majestic response: {body[:300]}", flush=True)
+
+            except Exception as e:
+                print(f"[ERROR] Majestic restart failed: {e}", file=sys.stderr)
+
+            finally:
+                GLib.idle_add(self.finish_restart_majestic_request)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_placeholder_button_press(self, widget, event):
         if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:

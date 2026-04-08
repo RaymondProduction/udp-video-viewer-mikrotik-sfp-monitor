@@ -35,6 +35,15 @@ APP_ID = "knyaz-vandam-ground-station"
 ICON_THEME_NAME = APP_ID
 
 
+def get_default_majestic_user() -> str:
+    return "".join(chr(x) for x in (114, 111, 111, 116))
+
+
+def get_default_majestic_password() -> str:
+    encoded_parts = ["cHV0", "aW5f", "SFVJ", "TE8="]
+    return base64.b64decode("".join(encoded_parts)).decode("utf-8")
+
+
 def get_app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         meipass = getattr(sys, "_MEIPASS", None)
@@ -717,6 +726,9 @@ class UdpVideoWindow:
         self.bridge_verbose = bridge_verbose
         self.bridge_hex = bridge_hex
 
+        self.bridge_http_user = get_default_majestic_user()
+        self.bridge_http_password = get_default_majestic_password()
+
         self.running = True
         self.identity_name = ""
         self.auto_controller_enabled = not bool(self.serial_dev)
@@ -741,6 +753,11 @@ class UdpVideoWindow:
         self.majestic_restart_last_time = 0.0
         self.majestic_restart_debounce_sec = 3.0
         self.btn_restart_mj = None
+
+        self.waiting_for_majestic_stream = False
+        self.majestic_stream_deadline = 0.0
+        self.majestic_stream_recovery_attempted = False
+        self.majestic_stream_wait_timeout_sec = 8.0
 
         self.load_settings()
 
@@ -1011,6 +1028,8 @@ class UdpVideoWindow:
         self.bridge_local_bind_port = 0
         self.bridge_verbose = False
         self.bridge_hex = True
+        self.bridge_http_user = get_default_majestic_user()
+        self.bridge_http_password = get_default_majestic_password()
 
     def load_settings(self):
         self.set_default_settings()
@@ -1050,6 +1069,13 @@ class UdpVideoWindow:
             self.bridge_local_bind_port = int(bridge.get("local_bind_port", self.bridge_local_bind_port))
             self.bridge_verbose = bool(bridge.get("verbose", self.bridge_verbose))
             self.bridge_hex = bool(bridge.get("hex", self.bridge_hex))
+            self.bridge_http_user = str(bridge.get("http_user", self.bridge_http_user))
+            self.bridge_http_password = str(bridge.get("http_password", self.bridge_http_password))
+
+            if not self.bridge_http_user:
+                self.bridge_http_user = get_default_majestic_user()
+            if not self.bridge_http_password:
+                self.bridge_http_password = get_default_majestic_password()
 
             video = data.get("video", {})
             self.port = int(video.get("port", self.port))
@@ -1095,6 +1121,8 @@ class UdpVideoWindow:
                 "local_bind_port": self.bridge_local_bind_port,
                 "verbose": self.bridge_verbose,
                 "hex": self.bridge_hex,
+                "http_user": self.bridge_http_user,
+                "http_password": self.bridge_http_password,
             },
             "video": {
                 "port": self.port,
@@ -1313,8 +1341,16 @@ class UdpVideoWindow:
 
     def on_monitor_new_sample(self, sink):
         self.last_video_frame_time = time.time()
+
+        if self.waiting_for_majestic_stream:
+            self.waiting_for_majestic_stream = False
+            self.majestic_stream_recovery_attempted = False
+            self.majestic_stream_deadline = 0.0
+            print("[INFO] Відеопотік після Restart MJ відновився", flush=True)
+
         if self.placeholder_visible:
             GLib.idle_add(self.set_placeholder_visible, False)
+
         return Gst.FlowReturn.OK
 
     def set_placeholder_visible(self, visible: bool):
@@ -1354,6 +1390,19 @@ class UdpVideoWindow:
                     if not self.placeholder_visible:
                         GLib.idle_add(self.set_placeholder_visible, True)
 
+                if self.waiting_for_majestic_stream:
+                    if has_signal:
+                        self.waiting_for_majestic_stream = False
+                        self.majestic_stream_recovery_attempted = False
+                        self.majestic_stream_deadline = 0.0
+                    elif (
+                        not self.majestic_stream_recovery_attempted
+                        and now >= self.majestic_stream_deadline
+                    ):
+                        print("[INFO] Після Restart MJ кадри не з'явилися, перезапускаю відеопайплайн", flush=True)
+                        self.majestic_stream_recovery_attempted = True
+                        GLib.idle_add(self.restart_video_pipeline_safe)
+
             except Exception as e:
                 print(f"[WARN] video_signal_loop: {e}", file=sys.stderr)
 
@@ -1377,6 +1426,21 @@ class UdpVideoWindow:
 
         GLib.idle_add(self.set_restart_majestic_button_enabled, False)
         GLib.timeout_add(int(self.majestic_restart_debounce_sec * 1000), self.set_restart_majestic_button_enabled, True)
+        return False
+
+    def begin_waiting_for_majestic_stream(self):
+        self.last_video_frame_time = 0.0
+        self.waiting_for_majestic_stream = True
+        self.majestic_stream_recovery_attempted = False
+        self.majestic_stream_deadline = time.time() + self.majestic_stream_wait_timeout_sec
+        self.set_placeholder_visible(True)
+        return False
+
+    def restart_video_pipeline_safe(self):
+        try:
+            self.restart_video_pipeline()
+        except Exception as e:
+            print(f"[WARN] restart_video_pipeline_safe: {e}", file=sys.stderr)
         return False
 
     def restart_majestic(self):
@@ -1404,8 +1468,8 @@ class UdpVideoWindow:
 
         def worker():
             try:
-                user = "root"
-                password = "putin_HUILO"
+                user = self.bridge_http_user or get_default_majestic_user()
+                password = self.bridge_http_password or get_default_majestic_password()
 
                 auth = base64.b64encode(f"{user}:{password}".encode()).decode()
                 url = f"http://{host}/cgi-bin/mj-settings.cgi"
@@ -1415,7 +1479,7 @@ class UdpVideoWindow:
                     url,
                     data=data,
                     method="POST",
-                    headers = {
+                    headers={
                         "Authorization": f"Basic {auth}",
                         "Content-Type": "application/x-www-form-urlencoded",
                     },
@@ -1428,6 +1492,8 @@ class UdpVideoWindow:
                     print(f"[INFO] Majestic restart sent to {host}, HTTP {resp.status}", flush=True)
                     if body:
                         print(f"[INFO] Majestic response: {body[:300]}", flush=True)
+
+                GLib.idle_add(self.begin_waiting_for_majestic_stream)
 
             except Exception as e:
                 print(f"[ERROR] Majestic restart failed: {e}", file=sys.stderr)
@@ -2146,7 +2212,7 @@ StartupWMClass={APP_ID}
         hint_frame, hint_grid = self.make_section("Права доступу до serial-порту")
         hint_label = Gtk.Label(
             label=(
-                "Якщо bridge не може відкрити /dev/ttyACM0 або /dev/ttyUSB0 через Permission denied,\n"
+                "Якщо bridge не може відкрити /dev/ttyACM0 або /dev/ttyUSB0 через Permission denied,\n\n"
                 "виконайте в терміналі:\n\n"
                 "sudo usermod -aG dialout $USER\n\n"
                 "Після цього перелогіньтесь або перезавантажтесь."
@@ -2201,6 +2267,16 @@ StartupWMClass={APP_ID}
         spin_local_bind_port.set_value(self.bridge_local_bind_port)
         self.add_labeled_row(grid_udp, 3, "Локальний bind порт:", spin_local_bind_port)
 
+        frame_http_auth, grid_http_auth = self.make_section("Majestic HTTP авторизація")
+        entry_bridge_http_user = Gtk.Entry()
+        entry_bridge_http_user.set_text(self.bridge_http_user)
+        self.add_labeled_row(grid_http_auth, 0, "Логін Majestic:", entry_bridge_http_user)
+
+        entry_bridge_http_password = Gtk.Entry()
+        entry_bridge_http_password.set_visibility(False)
+        entry_bridge_http_password.set_text(self.bridge_http_password)
+        self.add_labeled_row(grid_http_auth, 1, "Пароль Majestic:", entry_bridge_http_password)
+
         frame_logs, grid_logs = self.make_section("Логи")
         chk_bridge_verbose = Gtk.CheckButton(label="Показувати логи bridge")
         chk_bridge_verbose.set_active(self.bridge_verbose)
@@ -2213,6 +2289,7 @@ StartupWMClass={APP_ID}
         bridge_page.pack_start(hint_frame, False, False, 0)
         bridge_page.pack_start(frame_serial, False, False, 0)
         bridge_page.pack_start(frame_udp, False, False, 0)
+        bridge_page.pack_start(frame_http_auth, False, False, 0)
         bridge_page.pack_start(frame_logs, False, False, 0)
         bridge_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(bridge_page, Gtk.Label(label="Міст керування"))
@@ -2314,6 +2391,8 @@ StartupWMClass={APP_ID}
             spin_remote_port.set_value(9000)
             entry_local_bind_ip.set_text("0.0.0.0")
             spin_local_bind_port.set_value(0)
+            entry_bridge_http_user.set_text(get_default_majestic_user())
+            entry_bridge_http_password.set_text(get_default_majestic_password())
             chk_bridge_verbose.set_active(False)
             chk_bridge_hex.set_active(True)
 
@@ -2356,6 +2435,8 @@ StartupWMClass={APP_ID}
                     self.bridge_local_bind_port,
                     self.bridge_verbose,
                     self.bridge_hex,
+                    self.bridge_http_user,
+                    self.bridge_http_password,
                 )
 
                 prev_mikrotik_state = (
@@ -2387,6 +2468,8 @@ StartupWMClass={APP_ID}
                 self.bridge_remote_port = spin_remote_port.get_value_as_int()
                 self.bridge_local_bind_ip = entry_local_bind_ip.get_text().strip() or "0.0.0.0"
                 self.bridge_local_bind_port = spin_local_bind_port.get_value_as_int()
+                self.bridge_http_user = entry_bridge_http_user.get_text().strip() or get_default_majestic_user()
+                self.bridge_http_password = entry_bridge_http_password.get_text() or get_default_majestic_password()
                 self.bridge_verbose = chk_bridge_verbose.get_active()
                 self.bridge_hex = chk_bridge_hex.get_active()
 
@@ -2416,6 +2499,8 @@ StartupWMClass={APP_ID}
                     self.bridge_local_bind_port,
                     self.bridge_verbose,
                     self.bridge_hex,
+                    self.bridge_http_user,
+                    self.bridge_http_password,
                 )
                 bridge_changed = bridge_state != prev_bridge_state
 

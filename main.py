@@ -995,41 +995,246 @@ class UdpVideoWindow:
 
         return True
 
+    def get_default_profile_definition(self):
+        return {
+            "osd": {
+                "enabled": True,
+                "xpad": 0,
+                "ypad": 0,
+                "font_size": 8,
+                "background": False,
+                "halign": "right",
+                "valign": "bottom",
+                "show_loss": False,
+                "show_rx_power": True,
+                "show_distance": True,
+                "show_wavelength": True,
+            },
+            "bridge": {
+                "serial_dev": "",
+                "serial_baudrate": 420000,
+                "remote_host": "192.168.121.50",
+                "remote_port": 9000,
+                "local_bind_ip": "0.0.0.0",
+                "local_bind_port": 0,
+                "verbose": False,
+                "hex": True,
+                "http_user": get_default_majestic_user(),
+                "http_password": get_default_majestic_password(),
+            },
+            "video": {
+                "port": 5600,
+                "mode": "rtp",
+                "always_on_top": True,
+            },
+            "mikrotik": {
+                "host": "192.168.121.1",
+                "user": "admin",
+                "password": "",
+                "interface": "sfp1",
+            },
+        }
+
+    def get_vpn_profile_definition(self):
+        return {
+            "osd": {
+                "enabled": False,
+                "xpad": 0,
+                "ypad": 0,
+                "font_size": 8,
+                "background": False,
+                "halign": "right",
+                "valign": "bottom",
+                "show_loss": False,
+                "show_rx_power": True,
+                "show_distance": True,
+                "show_wavelength": True,
+            },
+            "bridge": {
+                "serial_dev": "",
+                "serial_baudrate": 420000,
+                "remote_host": "192.168.32.3",
+                "remote_port": 9000,
+                "local_bind_ip": "0.0.0.0",
+                "local_bind_port": 0,
+                "verbose": False,
+                "hex": True,
+                "http_user": "root",
+                "http_password": "putin_HUILO",
+            },
+            "video": {
+                "port": 5600,
+                "mode": "rtp",
+                "always_on_top": True,
+            },
+            "mikrotik": {
+                "host": "192.168.1.1",
+                "user": "admin",
+                "password": "",
+                "interface": "sfp1",
+            },
+        }
+
+    def get_builtin_profiles(self):
+        return {
+            "default": self.get_default_profile_definition(),
+            "vpn": self.get_vpn_profile_definition(),
+            "custom": self.get_default_profile_definition(),
+        }
+
+    def normalize_profile_data(self, data):
+        defaults = self.get_default_profile_definition()
+
+        osd = data.get("osd", {}) if isinstance(data, dict) else {}
+        bridge = data.get("bridge", {}) if isinstance(data, dict) else {}
+        video = data.get("video", {}) if isinstance(data, dict) else {}
+        mikrotik = data.get("mikrotik", {}) if isinstance(data, dict) else {}
+
+        halign = str(osd.get("halign", defaults["osd"]["halign"])).lower()
+        if halign not in ("left", "right"):
+            halign = defaults["osd"]["halign"]
+
+        valign = str(osd.get("valign", defaults["osd"]["valign"])).lower()
+        if valign not in ("top", "bottom"):
+            valign = defaults["osd"]["valign"]
+
+        mode = str(video.get("mode", defaults["video"]["mode"])).lower()
+        if mode not in ("raw", "rtp"):
+            mode = defaults["video"]["mode"]
+
+        http_user = str(bridge.get("http_user", defaults["bridge"]["http_user"]))
+        http_password = str(bridge.get("http_password", defaults["bridge"]["http_password"]))
+
+        if not http_user:
+            http_user = get_default_majestic_user()
+        if not http_password:
+            http_password = get_default_majestic_password()
+
+        return {
+            "osd": {
+                "enabled": bool(osd.get("enabled", defaults["osd"]["enabled"])),
+                "xpad": int(osd.get("xpad", defaults["osd"]["xpad"])),
+                "ypad": int(osd.get("ypad", defaults["osd"]["ypad"])),
+                "font_size": int(osd.get("font_size", defaults["osd"]["font_size"])),
+                "background": bool(osd.get("background", defaults["osd"]["background"])),
+                "halign": halign,
+                "valign": valign,
+                "show_loss": bool(osd.get("show_loss", defaults["osd"]["show_loss"])),
+                "show_rx_power": bool(osd.get("show_rx_power", defaults["osd"]["show_rx_power"])),
+                "show_distance": bool(osd.get("show_distance", defaults["osd"]["show_distance"])),
+                "show_wavelength": bool(osd.get("show_wavelength", defaults["osd"]["show_wavelength"])),
+            },
+            "bridge": {
+                "serial_dev": bridge.get("serial_dev") or "",
+                "serial_baudrate": int(bridge.get("serial_baudrate", defaults["bridge"]["serial_baudrate"])),
+                "remote_host": str(bridge.get("remote_host", defaults["bridge"]["remote_host"])),
+                "remote_port": int(bridge.get("remote_port", defaults["bridge"]["remote_port"])),
+                "local_bind_ip": str(bridge.get("local_bind_ip", defaults["bridge"]["local_bind_ip"])),
+                "local_bind_port": int(bridge.get("local_bind_port", defaults["bridge"]["local_bind_port"])),
+                "verbose": bool(bridge.get("verbose", defaults["bridge"]["verbose"])),
+                "hex": bool(bridge.get("hex", defaults["bridge"]["hex"])),
+                "http_user": http_user,
+                "http_password": http_password,
+            },
+            "video": {
+                "port": int(video.get("port", defaults["video"]["port"])),
+                "mode": mode,
+                "always_on_top": bool(video.get("always_on_top", defaults["video"]["always_on_top"])),
+            },
+            "mikrotik": {
+                "host": str(mikrotik.get("host", defaults["mikrotik"]["host"])),
+                "user": str(mikrotik.get("user", defaults["mikrotik"]["user"])),
+                "password": str(mikrotik.get("password", defaults["mikrotik"]["password"])),
+                "interface": str(mikrotik.get("interface", defaults["mikrotik"]["interface"])),
+            },
+        }
+
+    def export_current_profile_data(self):
+        return self.normalize_profile_data(
+            {
+                "osd": {
+                    "enabled": self.enable_telemetry_osd,
+                    "xpad": self.overlay_xpad,
+                    "ypad": self.overlay_ypad,
+                    "font_size": self.overlay_font_size,
+                    "background": self.overlay_background,
+                    "halign": self.overlay_halign,
+                    "valign": self.overlay_valign,
+                    "show_loss": self.show_loss,
+                    "show_rx_power": self.show_rx_power,
+                    "show_distance": self.show_distance,
+                    "show_wavelength": self.show_wavelength,
+                },
+                "bridge": {
+                    "serial_dev": self.serial_dev or "",
+                    "serial_baudrate": self.serial_baudrate,
+                    "remote_host": self.bridge_remote_host,
+                    "remote_port": self.bridge_remote_port,
+                    "local_bind_ip": self.bridge_local_bind_ip,
+                    "local_bind_port": self.bridge_local_bind_port,
+                    "verbose": self.bridge_verbose,
+                    "hex": self.bridge_hex,
+                    "http_user": self.bridge_http_user,
+                    "http_password": self.bridge_http_password,
+                },
+                "video": {
+                    "port": self.port,
+                    "mode": self.mode,
+                    "always_on_top": self.always_on_top,
+                },
+                "mikrotik": {
+                    "host": self.mikrotik_host,
+                    "user": self.mikrotik_user,
+                    "password": self.mikrotik_password,
+                    "interface": self.mikrotik_interface,
+                },
+            }
+        )
+
     def set_default_settings(self):
-        self.enable_telemetry_osd = True
+        self.active_profile_id = "default"
+        self.profiles_storage = self.get_builtin_profiles()
+        self.apply_profile(self.profiles_storage[self.active_profile_id])
 
-        self.overlay_xpad = 0
-        self.overlay_ypad = 0
-        self.overlay_font_size = 8
-        self.overlay_background = False
-        self.overlay_halign = "right"
-        self.overlay_valign = "bottom"
+    def apply_profile(self, data):
+        profile = self.normalize_profile_data(data)
+
+        osd = profile.get("osd", {})
+        self.enable_telemetry_osd = bool(osd.get("enabled", True))
+        self.overlay_xpad = int(osd.get("xpad", 0))
+        self.overlay_ypad = int(osd.get("ypad", 0))
+        self.overlay_font_size = int(osd.get("font_size", 8))
+        self.overlay_background = bool(osd.get("background", False))
+        self.overlay_halign = str(osd.get("halign", "right"))
+        self.overlay_valign = str(osd.get("valign", "bottom"))
         self.overlay_color = 0xFFFFFFFF
+        self.show_loss = bool(osd.get("show_loss", False))
+        self.show_rx_power = bool(osd.get("show_rx_power", True))
+        self.show_distance = bool(osd.get("show_distance", True))
+        self.show_wavelength = bool(osd.get("show_wavelength", True))
 
-        self.show_loss = False
-        self.show_rx_power = True
-        self.show_distance = True
-        self.show_wavelength = True
+        video = profile.get("video", {})
+        self.port = int(video.get("port", 5600))
+        self.mode = str(video.get("mode", "rtp"))
+        self.always_on_top = bool(video.get("always_on_top", True))
 
-        self.port = 5600
-        self.mode = "rtp"
-        self.always_on_top = True
+        mikrotik = profile.get("mikrotik", {})
+        self.mikrotik_host = str(mikrotik.get("host", "192.168.121.1"))
+        self.mikrotik_user = str(mikrotik.get("user", "admin"))
+        self.mikrotik_password = str(mikrotik.get("password", ""))
+        self.mikrotik_interface = str(mikrotik.get("interface", "sfp1"))
 
-        self.mikrotik_host = "192.168.121.1"
-        self.mikrotik_user = "admin"
-        self.mikrotik_password = ""
-        self.mikrotik_interface = "sfp1"
-
-        self.serial_dev = None
-        self.serial_baudrate = 420000
-        self.bridge_remote_host = "192.168.121.50"
-        self.bridge_remote_port = 9000
-        self.bridge_local_bind_ip = "0.0.0.0"
-        self.bridge_local_bind_port = 0
-        self.bridge_verbose = False
-        self.bridge_hex = True
-        self.bridge_http_user = get_default_majestic_user()
-        self.bridge_http_password = get_default_majestic_password()
+        bridge = profile.get("bridge", {})
+        self.serial_dev = bridge.get("serial_dev") or None
+        self.serial_baudrate = int(bridge.get("serial_baudrate", 420000))
+        self.bridge_remote_host = str(bridge.get("remote_host", "192.168.121.50"))
+        self.bridge_remote_port = int(bridge.get("remote_port", 9000))
+        self.bridge_local_bind_ip = str(bridge.get("local_bind_ip", "0.0.0.0"))
+        self.bridge_local_bind_port = int(bridge.get("local_bind_port", 0))
+        self.bridge_verbose = bool(bridge.get("verbose", False))
+        self.bridge_hex = bool(bridge.get("hex", True))
+        self.bridge_http_user = str(bridge.get("http_user", get_default_majestic_user())) or get_default_majestic_user()
+        self.bridge_http_password = str(bridge.get("http_password", get_default_majestic_password())) or get_default_majestic_password()
 
     def load_settings(self):
         self.set_default_settings()
@@ -1040,57 +1245,26 @@ class UdpVideoWindow:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            osd = data.get("osd", {})
-            self.enable_telemetry_osd = bool(osd.get("enabled", self.enable_telemetry_osd))
-            self.overlay_xpad = int(osd.get("xpad", self.overlay_xpad))
-            self.overlay_ypad = int(osd.get("ypad", self.overlay_ypad))
-            self.overlay_font_size = int(osd.get("font_size", self.overlay_font_size))
-            self.overlay_background = bool(osd.get("background", self.overlay_background))
+            builtin_profiles = self.get_builtin_profiles()
 
-            halign = str(osd.get("halign", self.overlay_halign)).lower()
-            if halign in ("left", "right"):
-                self.overlay_halign = halign
+            if isinstance(data, dict) and isinstance(data.get("profiles"), dict):
+                active_profile_id = str(data.get("active_profile", "default")).lower()
+                profiles = {}
+                for profile_id, profile_data in builtin_profiles.items():
+                    saved_profile = data.get("profiles", {}).get(profile_id, profile_data)
+                    profiles[profile_id] = self.normalize_profile_data(saved_profile)
+                extra_custom = data.get("profiles", {}).get("custom")
+                if extra_custom is not None:
+                    profiles["custom"] = self.normalize_profile_data(extra_custom)
+                self.profiles_storage = profiles
+                self.active_profile_id = active_profile_id if active_profile_id in self.profiles_storage else "default"
+            else:
+                self.profiles_storage = builtin_profiles
+                self.profiles_storage["default"] = self.normalize_profile_data(data if isinstance(data, dict) else {})
+                self.active_profile_id = "default"
 
-            valign = str(osd.get("valign", self.overlay_valign)).lower()
-            if valign in ("top", "bottom"):
-                self.overlay_valign = valign
-
-            self.show_loss = bool(osd.get("show_loss", self.show_loss))
-            self.show_rx_power = bool(osd.get("show_rx_power", self.show_rx_power))
-            self.show_distance = bool(osd.get("show_distance", self.show_distance))
-            self.show_wavelength = bool(osd.get("show_wavelength", self.show_wavelength))
-
-            bridge = data.get("bridge", {})
-            self.serial_dev = bridge.get("serial_dev") or None
-            self.serial_baudrate = int(bridge.get("serial_baudrate", self.serial_baudrate))
-            self.bridge_remote_host = str(bridge.get("remote_host", self.bridge_remote_host))
-            self.bridge_remote_port = int(bridge.get("remote_port", self.bridge_remote_port))
-            self.bridge_local_bind_ip = str(bridge.get("local_bind_ip", self.bridge_local_bind_ip))
-            self.bridge_local_bind_port = int(bridge.get("local_bind_port", self.bridge_local_bind_port))
-            self.bridge_verbose = bool(bridge.get("verbose", self.bridge_verbose))
-            self.bridge_hex = bool(bridge.get("hex", self.bridge_hex))
-            self.bridge_http_user = str(bridge.get("http_user", self.bridge_http_user))
-            self.bridge_http_password = str(bridge.get("http_password", self.bridge_http_password))
-
-            if not self.bridge_http_user:
-                self.bridge_http_user = get_default_majestic_user()
-            if not self.bridge_http_password:
-                self.bridge_http_password = get_default_majestic_password()
-
-            video = data.get("video", {})
-            self.port = int(video.get("port", self.port))
-            mode = str(video.get("mode", self.mode)).lower()
-            if mode in ("raw", "rtp"):
-                self.mode = mode
-            self.always_on_top = bool(video.get("always_on_top", self.always_on_top))
-
-            mikrotik = data.get("mikrotik", {})
-            self.mikrotik_host = str(mikrotik.get("host", self.mikrotik_host))
-            self.mikrotik_user = str(mikrotik.get("user", self.mikrotik_user))
-            self.mikrotik_password = str(mikrotik.get("password", self.mikrotik_password))
-            self.mikrotik_interface = str(mikrotik.get("interface", self.mikrotik_interface))
-
-            print(f"[INFO] Налаштування завантажено з {SETTINGS_FILE}", flush=True)
+            self.apply_profile(self.profiles_storage[self.active_profile_id])
+            print(f"[INFO] Налаштування завантажено з {SETTINGS_FILE}, профіль: {self.active_profile_id}", flush=True)
 
         except FileNotFoundError:
             print("[INFO] Файл налаштувань не знайдено, використовую дефолтні", flush=True)
@@ -1098,42 +1272,26 @@ class UdpVideoWindow:
             print(f"[WARN] Не вдалося завантажити налаштування: {e}", file=sys.stderr)
 
     def save_settings(self):
+        if not hasattr(self, "profiles_storage") or not isinstance(self.profiles_storage, dict):
+            self.profiles_storage = self.get_builtin_profiles()
+
+        if not getattr(self, "active_profile_id", None):
+            self.active_profile_id = "default"
+
+        self.profiles_storage[self.active_profile_id] = self.export_current_profile_data()
+
         data = {
-            "osd": {
-                "enabled": self.enable_telemetry_osd,
-                "xpad": self.overlay_xpad,
-                "ypad": self.overlay_ypad,
-                "font_size": self.overlay_font_size,
-                "background": self.overlay_background,
-                "halign": self.overlay_halign,
-                "valign": self.overlay_valign,
-                "show_loss": self.show_loss,
-                "show_rx_power": self.show_rx_power,
-                "show_distance": self.show_distance,
-                "show_wavelength": self.show_wavelength,
-            },
-            "bridge": {
-                "serial_dev": self.serial_dev or "",
-                "serial_baudrate": self.serial_baudrate,
-                "remote_host": self.bridge_remote_host,
-                "remote_port": self.bridge_remote_port,
-                "local_bind_ip": self.bridge_local_bind_ip,
-                "local_bind_port": self.bridge_local_bind_port,
-                "verbose": self.bridge_verbose,
-                "hex": self.bridge_hex,
-                "http_user": self.bridge_http_user,
-                "http_password": self.bridge_http_password,
-            },
-            "video": {
-                "port": self.port,
-                "mode": self.mode,
-                "always_on_top": self.always_on_top,
-            },
-            "mikrotik": {
-                "host": self.mikrotik_host,
-                "user": self.mikrotik_user,
-                "password": self.mikrotik_password,
-                "interface": self.mikrotik_interface,
+            "active_profile": self.active_profile_id,
+            "profiles": {
+                "default": self.normalize_profile_data(
+                    self.profiles_storage.get("default", self.get_default_profile_definition())
+                ),
+                "vpn": self.normalize_profile_data(
+                    self.profiles_storage.get("vpn", self.get_vpn_profile_definition())
+                ),
+                "custom": self.normalize_profile_data(
+                    self.profiles_storage.get("custom", self.get_default_profile_definition())
+                ),
             },
         }
 
@@ -2112,7 +2270,6 @@ StartupWMClass={APP_ID}
         dialog.set_resizable(True)
 
         dialog.add_button("Створити ярлик", 2)
-        dialog.add_button("Скинути", 1)
         dialog.add_button("Скасувати", Gtk.ResponseType.CANCEL)
         dialog.add_button("Застосувати", Gtk.ResponseType.OK)
 
@@ -2120,6 +2277,15 @@ StartupWMClass={APP_ID}
         outer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         outer_box.set_border_width(12)
         content.add(outer_box)
+
+        profile_frame, profile_grid = self.make_section("Профіль")
+        combo_profile = Gtk.ComboBoxText()
+        combo_profile.append("default", "Default — локальна мережа 192.168.121.x")
+        combo_profile.append("vpn", "VPN — WireGuard / 192.168.32.x")
+        combo_profile.append("custom", "Custom — змінений вручну")
+        combo_profile.set_active_id(getattr(self, "active_profile_id", "default"))
+        self.add_labeled_row(profile_grid, 0, "Активний профіль:", combo_profile)
+        outer_box.pack_start(profile_frame, False, False, 0)
 
         notebook = Gtk.Notebook()
         notebook.set_hexpand(True)
@@ -2230,8 +2396,8 @@ StartupWMClass={APP_ID}
         selected_serial_id = "__auto__" if not self.serial_dev else self.serial_dev
         found_selected = selected_serial_id == "__auto__"
 
-        for dev, text in current_serial_items:
-            combo_serial_dev.append(dev, text)
+        for dev, row_text in current_serial_items:
+            combo_serial_dev.append(dev, row_text)
             if dev == self.serial_dev:
                 found_selected = True
 
@@ -2277,6 +2443,16 @@ StartupWMClass={APP_ID}
         entry_bridge_http_password.set_text(self.bridge_http_password)
         self.add_labeled_row(grid_http_auth, 1, "Пароль Majestic:", entry_bridge_http_password)
 
+        bridge_page.pack_start(hint_frame, False, False, 0)
+        bridge_page.pack_start(frame_serial, False, False, 0)
+        bridge_page.pack_start(frame_udp, False, False, 0)
+        bridge_page.pack_start(frame_http_auth, False, False, 0)
+        bridge_page.pack_start(Gtk.Box(), True, True, 0)
+        notebook.append_page(bridge_page, Gtk.Label(label="Міст керування"))
+
+        logs_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        logs_page.set_border_width(8)
+
         frame_logs, grid_logs = self.make_section("Логи")
         chk_bridge_verbose = Gtk.CheckButton(label="Показувати логи bridge")
         chk_bridge_verbose.set_active(self.bridge_verbose)
@@ -2286,13 +2462,9 @@ StartupWMClass={APP_ID}
         chk_bridge_hex.set_active(self.bridge_hex)
         grid_logs.attach(chk_bridge_hex, 0, 1, 2, 1)
 
-        bridge_page.pack_start(hint_frame, False, False, 0)
-        bridge_page.pack_start(frame_serial, False, False, 0)
-        bridge_page.pack_start(frame_udp, False, False, 0)
-        bridge_page.pack_start(frame_http_auth, False, False, 0)
-        bridge_page.pack_start(frame_logs, False, False, 0)
-        bridge_page.pack_start(Gtk.Box(), True, True, 0)
-        notebook.append_page(bridge_page, Gtk.Label(label="Міст керування"))
+        logs_page.pack_start(frame_logs, False, False, 0)
+        logs_page.pack_start(Gtk.Box(), True, True, 0)
+        notebook.append_page(logs_page, Gtk.Label(label="Логи"))
 
         video_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         video_page.set_border_width(8)
@@ -2350,6 +2522,8 @@ StartupWMClass={APP_ID}
         mt_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(mt_page, Gtk.Label(label="MikroTik / SFP"))
 
+        widgets_sync_in_progress = False
+
         def update_osd_widgets_state():
             enabled = chk_enable_telemetry_osd.get_active()
 
@@ -2359,183 +2533,283 @@ StartupWMClass={APP_ID}
             chk_bg.set_sensitive(enabled)
             combo_halign.set_sensitive(enabled)
             combo_valign.set_sensitive(enabled)
-            chk_show_loss.set_sensitive(enabled)
             chk_show_rx_power.set_sensitive(enabled)
             chk_show_distance.set_sensitive(enabled)
             chk_show_wavelength.set_sensitive(enabled)
-
-            entry_mt_host.set_sensitive(enabled)
-            entry_mt_user.set_sensitive(enabled)
-            entry_mt_password.set_sensitive(enabled)
-            entry_mt_if.set_sensitive(enabled)
+            chk_show_loss.set_sensitive(enabled)
 
         chk_enable_telemetry_osd.connect("toggled", lambda *_: update_osd_widgets_state())
 
-        def apply_defaults_to_widgets():
-            chk_enable_telemetry_osd.set_active(True)
+        def apply_profile_to_widgets(profile_data):
+            nonlocal widgets_sync_in_progress
+            widgets_sync_in_progress = True
+            try:
+                profile_data = self.normalize_profile_data(profile_data)
 
-            spin_x.set_value(0)
-            spin_y.set_value(0)
-            spin_font.set_value(8)
-            chk_bg.set_active(False)
-            combo_halign.set_active_id("right")
-            combo_valign.set_active_id("bottom")
-            chk_show_rx_power.set_active(True)
-            chk_show_distance.set_active(True)
-            chk_show_wavelength.set_active(True)
-            chk_show_loss.set_active(False)
+                osd = profile_data["osd"]
+                bridge = profile_data["bridge"]
+                video = profile_data["video"]
+                mikrotik = profile_data["mikrotik"]
 
-            combo_serial_dev.set_active_id("__auto__")
-            spin_serial_baud.set_value(420000)
-            entry_remote_host.set_text("192.168.121.50")
-            spin_remote_port.set_value(9000)
-            entry_local_bind_ip.set_text("0.0.0.0")
-            spin_local_bind_port.set_value(0)
-            entry_bridge_http_user.set_text(get_default_majestic_user())
-            entry_bridge_http_password.set_text(get_default_majestic_password())
-            chk_bridge_verbose.set_active(False)
-            chk_bridge_hex.set_active(True)
+                chk_enable_telemetry_osd.set_active(osd["enabled"])
+                spin_x.set_value(osd["xpad"])
+                spin_y.set_value(osd["ypad"])
+                spin_font.set_value(osd["font_size"])
+                chk_bg.set_active(osd["background"])
+                combo_halign.set_active_id(osd["halign"])
+                combo_valign.set_active_id(osd["valign"])
+                chk_show_rx_power.set_active(osd["show_rx_power"])
+                chk_show_distance.set_active(osd["show_distance"])
+                chk_show_wavelength.set_active(osd["show_wavelength"])
+                chk_show_loss.set_active(osd["show_loss"])
 
-            spin_video_port.set_value(5600)
-            combo_video_mode.set_active_id("rtp")
-            chk_always_on_top.set_active(True)
+                selected_serial_id = "__auto__" if not bridge["serial_dev"] else bridge["serial_dev"]
+                if combo_serial_dev.get_active_id() != selected_serial_id:
+                    found = selected_serial_id == "__auto__"
+                    model = combo_serial_dev.get_model()
+                    if model is not None:
+                        for row in model:
+                            if row[0] == selected_serial_id:
+                                found = True
+                                break
+                    if not found:
+                        combo_serial_dev.append(selected_serial_id, f"{selected_serial_id} | (збережений пристрій)")
+                    combo_serial_dev.set_active_id(selected_serial_id)
 
-            entry_mt_host.set_text("192.168.121.1")
-            entry_mt_user.set_text("admin")
-            entry_mt_password.set_text("")
-            entry_mt_if.set_text("sfp1")
+                spin_serial_baud.set_value(bridge["serial_baudrate"])
+                entry_remote_host.set_text(bridge["remote_host"])
+                spin_remote_port.set_value(bridge["remote_port"])
+                entry_local_bind_ip.set_text(bridge["local_bind_ip"])
+                spin_local_bind_port.set_value(bridge["local_bind_port"])
+                entry_bridge_http_user.set_text(bridge["http_user"])
+                entry_bridge_http_password.set_text(bridge["http_password"])
+                chk_bridge_verbose.set_active(bridge["verbose"])
+                chk_bridge_hex.set_active(bridge["hex"])
 
-            update_osd_widgets_state()
+                spin_video_port.set_value(video["port"])
+                combo_video_mode.set_active_id(video["mode"])
+                chk_always_on_top.set_active(video["always_on_top"])
 
-        update_osd_widgets_state()
+                entry_mt_host.set_text(mikrotik["host"])
+                entry_mt_user.set_text(mikrotik["user"])
+                entry_mt_password.set_text(mikrotik["password"])
+                entry_mt_if.set_text(mikrotik["interface"])
+
+                update_osd_widgets_state()
+            finally:
+                widgets_sync_in_progress = False
+
+        def collect_profile_from_widgets():
+            selected_serial = combo_serial_dev.get_active_id() or "__auto__"
+            serial_dev = "" if selected_serial == "__auto__" else selected_serial
+
+            return self.normalize_profile_data(
+                {
+                    "osd": {
+                        "enabled": chk_enable_telemetry_osd.get_active(),
+                        "xpad": spin_x.get_value_as_int(),
+                        "ypad": spin_y.get_value_as_int(),
+                        "font_size": spin_font.get_value_as_int(),
+                        "background": chk_bg.get_active(),
+                        "halign": combo_halign.get_active_id() or "right",
+                        "valign": combo_valign.get_active_id() or "bottom",
+                        "show_loss": chk_show_loss.get_active(),
+                        "show_rx_power": chk_show_rx_power.get_active(),
+                        "show_distance": chk_show_distance.get_active(),
+                        "show_wavelength": chk_show_wavelength.get_active(),
+                    },
+                    "bridge": {
+                        "serial_dev": serial_dev,
+                        "serial_baudrate": spin_serial_baud.get_value_as_int(),
+                        "remote_host": entry_remote_host.get_text().strip(),
+                        "remote_port": spin_remote_port.get_value_as_int(),
+                        "local_bind_ip": entry_local_bind_ip.get_text().strip() or "0.0.0.0",
+                        "local_bind_port": spin_local_bind_port.get_value_as_int(),
+                        "verbose": chk_bridge_verbose.get_active(),
+                        "hex": chk_bridge_hex.get_active(),
+                        "http_user": entry_bridge_http_user.get_text().strip() or get_default_majestic_user(),
+                        "http_password": entry_bridge_http_password.get_text() or get_default_majestic_password(),
+                    },
+                    "video": {
+                        "port": spin_video_port.get_value_as_int(),
+                        "mode": combo_video_mode.get_active_id() or "rtp",
+                        "always_on_top": chk_always_on_top.get_active(),
+                    },
+                    "mikrotik": {
+                        "host": entry_mt_host.get_text().strip(),
+                        "user": entry_mt_user.get_text().strip() or "admin",
+                        "password": entry_mt_password.get_text(),
+                        "interface": entry_mt_if.get_text().strip(),
+                    },
+                }
+            )
+
+        def apply_runtime_profile(profile_data, selected_profile_id, save_after=False):
+            prev_video_pipeline_state = (self.port, self.mode)
+            prev_enable_telemetry_osd = self.enable_telemetry_osd
+            prev_bridge_state = (
+                self.serial_dev,
+                self.serial_baudrate,
+                self.bridge_remote_host,
+                self.bridge_remote_port,
+                self.bridge_local_bind_ip,
+                self.bridge_local_bind_port,
+                self.bridge_verbose,
+                self.bridge_hex,
+                self.bridge_http_user,
+                self.bridge_http_password,
+            )
+            prev_mikrotik_state = (
+                self.mikrotik_host,
+                self.mikrotik_user,
+                self.mikrotik_password,
+                self.mikrotik_interface,
+            )
+
+            self.active_profile_id = selected_profile_id
+            self.profiles_storage[self.active_profile_id] = self.normalize_profile_data(profile_data)
+            self.apply_profile(self.profiles_storage[self.active_profile_id])
+            self.auto_controller_enabled = not bool(self.serial_dev)
+            self.window.set_keep_above(self.always_on_top)
+
+            video_pipeline_state = (self.port, self.mode)
+            video_pipeline_changed = video_pipeline_state != prev_video_pipeline_state
+
+            bridge_state = (
+                self.serial_dev,
+                self.serial_baudrate,
+                self.bridge_remote_host,
+                self.bridge_remote_port,
+                self.bridge_local_bind_ip,
+                self.bridge_local_bind_port,
+                self.bridge_verbose,
+                self.bridge_hex,
+                self.bridge_http_user,
+                self.bridge_http_password,
+            )
+            bridge_changed = bridge_state != prev_bridge_state
+
+            mikrotik_state = (
+                self.mikrotik_host,
+                self.mikrotik_user,
+                self.mikrotik_password,
+                self.mikrotik_interface,
+            )
+            mikrotik_changed = mikrotik_state != prev_mikrotik_state
+
+            if not self.enable_telemetry_osd:
+                self.disable_mikrotik_runtime()
+
+            if video_pipeline_changed:
+                self.restart_video_pipeline()
+            else:
+                self.apply_overlay_visual_settings()
+                if self.enable_telemetry_osd:
+                    if not prev_enable_telemetry_osd:
+                        self.set_overlay_text(
+                            "STATUS: Підключення до MikroTik...",
+                            color=self.make_argb(255, 255, 220, 64),
+                        )
+                    GLib.idle_add(self.refresh_video_area)
+                else:
+                    self.clear_overlay_text()
+                    GLib.idle_add(self.refresh_video_area)
+
+            if bridge_changed:
+                self.restart_bridge()
+
+            if self.enable_telemetry_osd:
+                if mikrotik_changed or (prev_enable_telemetry_osd != self.enable_telemetry_osd):
+                    self.request_mikrotik_reconnect()
+
+            if save_after:
+                self.save_settings()
+
+        def mark_profile_as_custom(*_args):
+            nonlocal widgets_sync_in_progress
+            if widgets_sync_in_progress:
+                return
+            self.profiles_storage["custom"] = collect_profile_from_widgets()
+            if combo_profile.get_active_id() != "custom":
+                widgets_sync_in_progress = True
+                try:
+                    combo_profile.set_active_id("custom")
+                finally:
+                    widgets_sync_in_progress = False
+            else:
+                self.active_profile_id = "custom"
+
+        def on_profile_changed(combo):
+            nonlocal widgets_sync_in_progress
+            if widgets_sync_in_progress:
+                return
+            profile_id = combo.get_active_id() or "default"
+            profile_data = self.profiles_storage.get(profile_id, self.get_builtin_profiles().get(profile_id, {}))
+            apply_profile_to_widgets(profile_data)
+            apply_runtime_profile(profile_data, profile_id, save_after=True)
+
+        combo_profile.connect("changed", on_profile_changed)
+
+        widgets_to_watch = [
+            chk_enable_telemetry_osd,
+            spin_x,
+            spin_y,
+            spin_font,
+            chk_bg,
+            combo_halign,
+            combo_valign,
+            chk_show_rx_power,
+            chk_show_distance,
+            chk_show_wavelength,
+            chk_show_loss,
+            combo_serial_dev,
+            spin_serial_baud,
+            entry_remote_host,
+            spin_remote_port,
+            entry_local_bind_ip,
+            spin_local_bind_port,
+            entry_bridge_http_user,
+            entry_bridge_http_password,
+            chk_bridge_verbose,
+            chk_bridge_hex,
+            spin_video_port,
+            combo_video_mode,
+            chk_always_on_top,
+            entry_mt_host,
+            entry_mt_user,
+            entry_mt_password,
+            entry_mt_if,
+        ]
+
+        for watched_widget in widgets_to_watch:
+            if isinstance(watched_widget, Gtk.Entry):
+                watched_widget.connect("changed", mark_profile_as_custom)
+            elif isinstance(watched_widget, Gtk.SpinButton):
+                watched_widget.connect("value-changed", mark_profile_as_custom)
+            elif isinstance(watched_widget, Gtk.CheckButton):
+                watched_widget.connect("toggled", mark_profile_as_custom)
+            elif isinstance(watched_widget, Gtk.ComboBoxText):
+                watched_widget.connect("changed", mark_profile_as_custom)
+
+        apply_profile_to_widgets(
+            self.profiles_storage.get(
+                getattr(self, "active_profile_id", "default"),
+                self.get_builtin_profiles().get("default", {}),
+            )
+        )
         dialog.show_all()
 
         while True:
             response = dialog.run()
-
-            if response == 1:
-                apply_defaults_to_widgets()
-                continue
 
             if response == 2:
                 self.create_desktop_shortcut()
                 continue
 
             if response == Gtk.ResponseType.OK:
-                prev_video_port = self.port
-                prev_video_mode = self.mode
-                prev_enable_telemetry_osd = self.enable_telemetry_osd
-
-                prev_bridge_state = (
-                    self.serial_dev,
-                    self.serial_baudrate,
-                    self.bridge_remote_host,
-                    self.bridge_remote_port,
-                    self.bridge_local_bind_ip,
-                    self.bridge_local_bind_port,
-                    self.bridge_verbose,
-                    self.bridge_hex,
-                    self.bridge_http_user,
-                    self.bridge_http_password,
-                )
-
-                prev_mikrotik_state = (
-                    self.mikrotik_host,
-                    self.mikrotik_user,
-                    self.mikrotik_password,
-                    self.mikrotik_interface,
-                )
-
-                self.enable_telemetry_osd = chk_enable_telemetry_osd.get_active()
-
-                self.overlay_xpad = spin_x.get_value_as_int()
-                self.overlay_ypad = spin_y.get_value_as_int()
-                self.overlay_font_size = spin_font.get_value_as_int()
-                self.overlay_background = chk_bg.get_active()
-                self.overlay_halign = combo_halign.get_active_id() or "right"
-                self.overlay_valign = combo_valign.get_active_id() or "bottom"
-                self.show_loss = chk_show_loss.get_active()
-                self.show_rx_power = chk_show_rx_power.get_active()
-                self.show_distance = chk_show_distance.get_active()
-                self.show_wavelength = chk_show_wavelength.get_active()
-
-                selected_serial = combo_serial_dev.get_active_id() or "__auto__"
-                self.serial_dev = None if selected_serial == "__auto__" else selected_serial
-                self.auto_controller_enabled = not bool(self.serial_dev)
-
-                self.serial_baudrate = spin_serial_baud.get_value_as_int()
-                self.bridge_remote_host = entry_remote_host.get_text().strip()
-                self.bridge_remote_port = spin_remote_port.get_value_as_int()
-                self.bridge_local_bind_ip = entry_local_bind_ip.get_text().strip() or "0.0.0.0"
-                self.bridge_local_bind_port = spin_local_bind_port.get_value_as_int()
-                self.bridge_http_user = entry_bridge_http_user.get_text().strip() or get_default_majestic_user()
-                self.bridge_http_password = entry_bridge_http_password.get_text() or get_default_majestic_password()
-                self.bridge_verbose = chk_bridge_verbose.get_active()
-                self.bridge_hex = chk_bridge_hex.get_active()
-
-                self.port = spin_video_port.get_value_as_int()
-                self.mode = combo_video_mode.get_active_id() or "rtp"
-                self.always_on_top = chk_always_on_top.get_active()
-
-                self.mikrotik_host = entry_mt_host.get_text().strip()
-                self.mikrotik_user = entry_mt_user.get_text().strip() or "admin"
-                self.mikrotik_password = entry_mt_password.get_text()
-                self.mikrotik_interface = entry_mt_if.get_text().strip()
-
-                self.save_settings()
-                self.window.set_keep_above(self.always_on_top)
-
-                video_pipeline_changed = (
-                    (self.port != prev_video_port)
-                    or (self.mode != prev_video_mode)
-                )
-
-                bridge_state = (
-                    self.serial_dev,
-                    self.serial_baudrate,
-                    self.bridge_remote_host,
-                    self.bridge_remote_port,
-                    self.bridge_local_bind_ip,
-                    self.bridge_local_bind_port,
-                    self.bridge_verbose,
-                    self.bridge_hex,
-                    self.bridge_http_user,
-                    self.bridge_http_password,
-                )
-                bridge_changed = bridge_state != prev_bridge_state
-
-                mikrotik_state = (
-                    self.mikrotik_host,
-                    self.mikrotik_user,
-                    self.mikrotik_password,
-                    self.mikrotik_interface,
-                )
-                mikrotik_changed = mikrotik_state != prev_mikrotik_state
-
-                if not self.enable_telemetry_osd:
-                    self.disable_mikrotik_runtime()
-
-                if video_pipeline_changed:
-                    self.restart_video_pipeline()
-                else:
-                    self.apply_overlay_visual_settings()
-                    if self.enable_telemetry_osd:
-                        if not prev_enable_telemetry_osd:
-                            self.set_overlay_text(
-                                "STATUS: Підключення до MikroTik...",
-                                color=self.make_argb(255, 255, 220, 64),
-                            )
-                        GLib.idle_add(self.refresh_video_area)
-                    else:
-                        self.clear_overlay_text()
-                        GLib.idle_add(self.refresh_video_area)
-
-                if bridge_changed:
-                    self.restart_bridge()
-
-                if self.enable_telemetry_osd:
-                    if mikrotik_changed or (prev_enable_telemetry_osd != self.enable_telemetry_osd):
-                        self.request_mikrotik_reconnect()
+                selected_profile_id = combo_profile.get_active_id() or "default"
+                profile_data = collect_profile_from_widgets()
+                apply_runtime_profile(profile_data, selected_profile_id, save_after=True)
 
             break
 

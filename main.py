@@ -1346,11 +1346,10 @@ class UdpVideoWindow:
         if mode == "rtp":
             return f"""
                 udpsrc port={port}
-                    caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"
-                ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 leaky=downstream
-                ! rtpjitterbuffer latency=30 drop-on-latency=true
+                    caps="application/x-rtp,media=video,encoding-name=H264"
+                ! rtpjitterbuffer latency=0
                 ! rtph264depay
-                ! h264parse config-interval=-1 disable-passthrough=true
+                ! h264parse
                 ! avdec_h264
                 ! videoconvert
                 {overlay_block}
@@ -1360,8 +1359,6 @@ class UdpVideoWindow:
                    ! gtksink name=videosink sync=false
 
                 t. ! queue leaky=downstream max-size-buffers=1
-                   ! videoconvert
-                   ! video/x-raw,format=RGB
                    ! appsink name=monitorsink emit-signals=true max-buffers=1 drop=true sync=false
             """
 

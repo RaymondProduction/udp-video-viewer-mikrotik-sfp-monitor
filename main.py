@@ -2590,7 +2590,7 @@ StartupWMClass={APP_ID}
             transient_for=self.window,
             flags=0,
         )
-        dialog.set_default_size(780, 720)
+        dialog.set_default_size(980, 620)
         dialog.set_resizable(True)
 
         dialog.add_button("Створити ярлик", 2)
@@ -2612,18 +2612,34 @@ StartupWMClass={APP_ID}
         outer_box.pack_start(profile_frame, False, False, 0)
 
         notebook = Gtk.Notebook()
+        notebook.set_tab_pos(Gtk.PositionType.LEFT)
         notebook.set_hexpand(True)
         notebook.set_vexpand(True)
         outer_box.pack_start(notebook, True, True, 0)
 
-        osd_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        osd_page.set_border_width(8)
+        mt_osd_page = Gtk.Grid()
+        mt_osd_page.set_border_width(8)
+        mt_osd_page.set_row_spacing(10)
+        mt_osd_page.set_column_spacing(12)
+        mt_osd_page.set_hexpand(True)
+        mt_osd_page.set_vexpand(True)
+
+        left_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        left_col.set_hexpand(True)
+        left_col.set_vexpand(True)
+        right_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        right_col.set_hexpand(True)
+        right_col.set_vexpand(True)
+
+        mt_osd_page.attach(left_col, 0, 0, 1, 1)
+        mt_osd_page.attach(right_col, 1, 0, 1, 1)
+        mt_osd_page.set_column_homogeneous(True)
 
         info_frame, info_grid = self.make_section("Пояснення")
         info_label = Gtk.Label(
             label=(
-                "OSD — це наекранне меню з даними, які беруться з MikroTik / SFP.\n"
-                "Можна повністю вимкнути телеметрію та OSD одним чекбоксом нижче."
+                "Це налаштування OSD, яке показує дані MikroTik / SFP. "
+                "Параметри перенесені сюди, щоб вкладка OSD не розтягувала все вікно."
             )
         )
         info_label.set_xalign(0.0)
@@ -2672,29 +2688,63 @@ StartupWMClass={APP_ID}
         self.add_labeled_row(grid_style, 3, "Вертикально:", combo_valign)
 
         frame_data, grid_data = self.make_section("Що показувати")
-        chk_show_rx_power = Gtk.CheckButton(label="Показувати RX power")
+        chk_show_rx_power = Gtk.CheckButton(label="RX power")
         chk_show_rx_power.set_active(self.show_rx_power)
-        grid_data.attach(chk_show_rx_power, 0, 0, 2, 1)
+        grid_data.attach(chk_show_rx_power, 0, 0, 1, 1)
 
-        chk_show_distance = Gtk.CheckButton(label="Показувати максимальну дистанцію SFP")
+        chk_show_distance = Gtk.CheckButton(label="Макс. дистанцію SFP")
         chk_show_distance.set_active(self.show_distance)
-        grid_data.attach(chk_show_distance, 0, 1, 2, 1)
+        grid_data.attach(chk_show_distance, 1, 0, 1, 1)
 
-        chk_show_wavelength = Gtk.CheckButton(label="Показувати довжину хвилі SFP")
+        chk_show_wavelength = Gtk.CheckButton(label="Довжину хвилі SFP")
         chk_show_wavelength.set_active(self.show_wavelength)
-        grid_data.attach(chk_show_wavelength, 0, 2, 2, 1)
+        grid_data.attach(chk_show_wavelength, 0, 1, 1, 1)
 
-        chk_show_loss = Gtk.CheckButton(label="Показувати затухання (різниця між TX power та RX power у dB)")
+        chk_show_loss = Gtk.CheckButton(label="Затухання TX-RX")
         chk_show_loss.set_active(self.show_loss)
-        grid_data.attach(chk_show_loss, 0, 3, 2, 1)
+        grid_data.attach(chk_show_loss, 1, 1, 1, 1)
 
-        osd_page.pack_start(info_frame, False, False, 0)
-        osd_page.pack_start(frame_show, False, False, 0)
-        osd_page.pack_start(frame_pos, False, False, 0)
-        osd_page.pack_start(frame_style, False, False, 0)
-        osd_page.pack_start(frame_data, False, False, 0)
-        osd_page.pack_start(Gtk.Box(), True, True, 0)
-        notebook.append_page(osd_page, Gtk.Label(label="OSD"))
+        frame_mt_conn, grid_mt_conn = self.make_section("Підключення MikroTik")
+        entry_mt_host = Gtk.Entry()
+        entry_mt_host.set_text(self.mikrotik_host or "")
+        self.add_labeled_row(grid_mt_conn, 0, "Host:", entry_mt_host)
+
+        entry_mt_user = Gtk.Entry()
+        entry_mt_user.set_text(self.mikrotik_user)
+        self.add_labeled_row(grid_mt_conn, 1, "Логін:", entry_mt_user)
+
+        entry_mt_password = Gtk.Entry()
+        entry_mt_password.set_visibility(False)
+        entry_mt_password.set_text(self.mikrotik_password)
+        self.add_labeled_row(grid_mt_conn, 2, "Пароль:", entry_mt_password)
+
+        frame_mt_if, grid_mt_if = self.make_section("SFP")
+        entry_mt_if = Gtk.Entry()
+        entry_mt_if.set_text(self.mikrotik_interface or "")
+        self.add_labeled_row(grid_mt_if, 0, "Інтерфейс:", entry_mt_if)
+
+        frame_mt_poll, grid_mt_poll = self.make_section("Оновлення")
+        lbl_poll = Gtk.Label(label=f"Інтервал опитування: {self.poll_interval:g} сек")
+        lbl_poll.set_xalign(0.0)
+        grid_mt_poll.attach(lbl_poll, 0, 0, 2, 1)
+
+        lbl_version = Gtk.Label(label=f"Версія: {APP_VERSION}")
+        lbl_version.set_xalign(0.0)
+
+        left_col.pack_start(info_frame, False, False, 0)
+        left_col.pack_start(frame_show, False, False, 0)
+        left_col.pack_start(frame_pos, False, False, 0)
+        left_col.pack_start(frame_style, False, False, 0)
+        left_col.pack_start(frame_data, False, False, 0)
+        left_col.pack_start(Gtk.Box(), True, True, 0)
+
+        right_col.pack_start(frame_mt_conn, False, False, 0)
+        right_col.pack_start(frame_mt_if, False, False, 0)
+        right_col.pack_start(frame_mt_poll, False, False, 0)
+        right_col.pack_start(lbl_version, False, False, 0)
+        right_col.pack_start(Gtk.Box(), True, True, 0)
+
+        notebook.append_page(mt_osd_page, Gtk.Label(label="MikroTik / SFP"))
 
         fc_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         fc_page.set_border_width(8)
@@ -2867,37 +2917,6 @@ StartupWMClass={APP_ID}
         video_page.pack_start(frame_window_behavior, False, False, 0)
         video_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(video_page, Gtk.Label(label="Відеопотік"))
-
-        mt_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        mt_page.set_border_width(8)
-
-        frame_mt_conn, grid_mt_conn = self.make_section("Підключення")
-        entry_mt_host = Gtk.Entry()
-        entry_mt_host.set_text(self.mikrotik_host or "")
-        self.add_labeled_row(grid_mt_conn, 0, "MikroTik host:", entry_mt_host)
-
-        entry_mt_user = Gtk.Entry()
-        entry_mt_user.set_text(self.mikrotik_user)
-        self.add_labeled_row(grid_mt_conn, 1, "Логін:", entry_mt_user)
-
-        entry_mt_password = Gtk.Entry()
-        entry_mt_password.set_visibility(False)
-        entry_mt_password.set_text(self.mikrotik_password)
-        self.add_labeled_row(grid_mt_conn, 2, "Пароль:", entry_mt_password)
-
-        frame_mt_if, grid_mt_if = self.make_section("Інтерфейс")
-        entry_mt_if = Gtk.Entry()
-        entry_mt_if.set_text(self.mikrotik_interface or "")
-        self.add_labeled_row(grid_mt_if, 0, "SFP інтерфейс:", entry_mt_if)
-
-        lbl_version = Gtk.Label(label=f"Версія: {APP_VERSION}")
-        lbl_version.set_xalign(0.0)
-
-        mt_page.pack_start(frame_mt_conn, False, False, 0)
-        mt_page.pack_start(frame_mt_if, False, False, 0)
-        mt_page.pack_start(lbl_version, False, False, 0)
-        mt_page.pack_start(Gtk.Box(), True, True, 0)
-        notebook.append_page(mt_page, Gtk.Label(label="MikroTik / SFP"))
 
         widgets_sync_in_progress = False
 

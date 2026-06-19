@@ -26,6 +26,7 @@ from serial.tools import list_ports
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gst", "1.0")
 from gi.repository import Gtk, Gst, GLib, Gdk, GdkPixbuf
+import cairo
 
 Gst.init(None)
 
@@ -99,6 +100,20 @@ PLACEHOLDER_IMAGE_FILE = first_existing_path(
         Path(__file__).resolve().parent / "80dshv.png",
     ]
 )
+
+# MSP DisplayPort telemetry from flight controller, forwarded by the camera over UDP.
+# This is intentionally separate from MikroTik/SFP telemetry.
+FC_MSP_DISPLAYPORT = 182
+FC_SUBCMD_CLEAR = 2
+FC_SUBCMD_WRITE = 3
+FC_SUBCMD_DRAW = 4
+FC_OSD_COLS = 50
+FC_OSD_ROWS = 18
+FC_FONT_CHAR_WIDTH = 24
+FC_FONT_CHAR_HEIGHT = 36
+FC_FONT_FILE = "font_btfl_hd.png"
+FC_OSD_SCALE = 0.85
+
 
 
 def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
@@ -257,6 +272,33 @@ def find_controller_serial_device() -> Optional[str]:
             return p.device
     return None
 
+
+
+
+def decode_fc_osd_byte(value: int) -> str:
+    """Best-effort conversion for Betaflight/MSP DisplayPort symbols to readable text."""
+    if value == 0 or value == 32:
+        return " "
+    if 32 <= value <= 126:
+        return chr(value)
+
+    # Common Betaflight HD font battery/voltage symbols are not plain ASCII.
+    # Keep them as compact placeholders instead of crashing or polluting the overlay.
+    replacements = {
+        0x9E: "V",
+        0x9F: "A",
+        0xB0: "°",
+    }
+    return replacements.get(value, " ")
+
+
+def build_fc_msp_request(cmd_id: int, payload: bytes = b"") -> bytes:
+    """Build MSP v1 request: $M< size cmd payload checksum."""
+    size = len(payload)
+    checksum = size ^ cmd_id
+    for b in payload:
+        checksum ^= b
+    return b"$M<" + bytes([size, cmd_id]) + payload + bytes([checksum & 0xFF])
 
 class MikroTikSshClient:
     def __init__(self, host: str, username: str, password: str, port: int = 22):
@@ -759,6 +801,30 @@ class UdpVideoWindow:
         self.majestic_stream_recovery_attempted = False
         self.majestic_stream_wait_timeout_sec = 8.0
 
+        self.fc_lock = threading.Lock()
+        self.fc_matrix = [0] * (FC_OSD_COLS * FC_OSD_ROWS)
+        self.fc_back_matrix = [0] * (FC_OSD_COLS * FC_OSD_ROWS)
+        self.fc_back_has_content = False
+        self.fc_last_text = ""
+        self.fc_status_text = "FC telemetry: вимкнено"
+        self.fc_last_packet_time = 0.0
+        self.fc_reconnect_requested = False
+        self.fc_canvas = None
+        self.fc_font_surface = None
+        fc_font_path = first_existing_path([
+            resource_path(FC_FONT_FILE),
+            Path(__file__).resolve().parent / FC_FONT_FILE,
+            Path.cwd() / FC_FONT_FILE,
+        ])
+        if fc_font_path and fc_font_path.exists():
+            try:
+                self.fc_font_surface = cairo.ImageSurface.create_from_png(str(fc_font_path))
+                print(f"[FC OSD] Завантажено шрифт: {fc_font_path}", flush=True)
+            except Exception as e:
+                print(f"[WARN] Не вдалося завантажити {FC_FONT_FILE}: {e}", file=sys.stderr)
+        else:
+            print(f"[WARN] {FC_FONT_FILE} не знайдено. FC OSD буде без bitmap-шрифту.", file=sys.stderr)
+
         self.load_settings()
 
         self.window = Gtk.Window(title=APP_NAME)
@@ -870,6 +936,7 @@ class UdpVideoWindow:
 
         self.pipeline = None
         self.overlay = None
+        self.fc_canvas = None
         self.video_sink = None
         self.bus = None
 
@@ -897,6 +964,9 @@ class UdpVideoWindow:
 
         self.video_signal_thread = threading.Thread(target=self.video_signal_loop, daemon=True)
         self.video_signal_thread.start()
+
+        self.fc_telemetry_thread = threading.Thread(target=self.fc_telemetry_loop, daemon=True)
+        self.fc_telemetry_thread.start()
 
     def apply_css(self):
         css = b"""
@@ -1033,6 +1103,14 @@ class UdpVideoWindow:
                 "password": "",
                 "interface": "sfp1",
             },
+            "fc_telemetry": {
+                "enabled": False,
+                "show_osd": True,
+                "host": "192.168.121.50",
+                "port": 9001,
+                "heartbeat_interval": 0.4,
+                "stale_timeout": 2.0,
+            },
         }
 
     def get_vpn_profile_definition(self):
@@ -1073,6 +1151,14 @@ class UdpVideoWindow:
                 "password": "",
                 "interface": "sfp1",
             },
+            "fc_telemetry": {
+                "enabled": False,
+                "show_osd": True,
+                "host": "192.168.32.3",
+                "port": 9001,
+                "heartbeat_interval": 0.4,
+                "stale_timeout": 2.0,
+            },
         }
 
     def get_builtin_profiles(self):
@@ -1089,6 +1175,7 @@ class UdpVideoWindow:
         bridge = data.get("bridge", {}) if isinstance(data, dict) else {}
         video = data.get("video", {}) if isinstance(data, dict) else {}
         mikrotik = data.get("mikrotik", {}) if isinstance(data, dict) else {}
+        fc_telemetry = data.get("fc_telemetry", {}) if isinstance(data, dict) else {}
 
         halign = str(osd.get("halign", defaults["osd"]["halign"])).lower()
         if halign not in ("left", "right"):
@@ -1147,6 +1234,14 @@ class UdpVideoWindow:
                 "password": str(mikrotik.get("password", defaults["mikrotik"]["password"])),
                 "interface": str(mikrotik.get("interface", defaults["mikrotik"]["interface"])),
             },
+            "fc_telemetry": {
+                "enabled": bool(fc_telemetry.get("enabled", defaults["fc_telemetry"]["enabled"])),
+                "show_osd": bool(fc_telemetry.get("show_osd", defaults["fc_telemetry"]["show_osd"])),
+                "host": str(fc_telemetry.get("host", defaults["fc_telemetry"]["host"])),
+                "port": int(fc_telemetry.get("port", defaults["fc_telemetry"]["port"])),
+                "heartbeat_interval": float(fc_telemetry.get("heartbeat_interval", defaults["fc_telemetry"]["heartbeat_interval"])),
+                "stale_timeout": float(fc_telemetry.get("stale_timeout", defaults["fc_telemetry"]["stale_timeout"])),
+            },
         }
 
     def export_current_profile_data(self):
@@ -1188,6 +1283,14 @@ class UdpVideoWindow:
                     "password": self.mikrotik_password,
                     "interface": self.mikrotik_interface,
                 },
+                "fc_telemetry": {
+                    "enabled": self.fc_telemetry_enabled,
+                    "show_osd": self.fc_telemetry_show_osd,
+                    "host": self.fc_telemetry_host,
+                    "port": self.fc_telemetry_port,
+                    "heartbeat_interval": self.fc_telemetry_heartbeat_interval,
+                    "stale_timeout": self.fc_telemetry_stale_timeout,
+                },
             }
         )
 
@@ -1223,6 +1326,14 @@ class UdpVideoWindow:
         self.mikrotik_user = str(mikrotik.get("user", "admin"))
         self.mikrotik_password = str(mikrotik.get("password", ""))
         self.mikrotik_interface = str(mikrotik.get("interface", "sfp1"))
+
+        fc_telemetry = profile.get("fc_telemetry", {})
+        self.fc_telemetry_enabled = bool(fc_telemetry.get("enabled", False))
+        self.fc_telemetry_show_osd = bool(fc_telemetry.get("show_osd", True))
+        self.fc_telemetry_host = str(fc_telemetry.get("host", "192.168.32.3"))
+        self.fc_telemetry_port = int(fc_telemetry.get("port", 9001))
+        self.fc_telemetry_heartbeat_interval = max(0.1, float(fc_telemetry.get("heartbeat_interval", 0.4)))
+        self.fc_telemetry_stale_timeout = max(0.5, float(fc_telemetry.get("stale_timeout", 2.0)))
 
         bridge = profile.get("bridge", {})
         self.serial_dev = bridge.get("serial_dev") or None
@@ -1332,6 +1443,7 @@ class UdpVideoWindow:
                 ! decodebin
                 ! videoconvert
                 {overlay_block}
+                ! cairooverlay name=fc_canvas
                 ! tee name=t
 
                 t. ! queue
@@ -1346,13 +1458,14 @@ class UdpVideoWindow:
         if mode == "rtp":
             return f"""
                 udpsrc port={port}
-                    caps="application/x-rtp,media=video,encoding-name=H264"
+                    caps="application/x-rtp,media=video,encoding-name=H265"
                 ! rtpjitterbuffer latency=0
-                ! rtph264depay
-                ! h264parse
-                ! avdec_h264
+                ! rtph265depay
+                ! h265parse
+                ! avdec_h265
                 ! videoconvert
                 {overlay_block}
+                ! cairooverlay name=fc_canvas
                 ! tee name=t
 
                 t. ! queue
@@ -1371,6 +1484,7 @@ class UdpVideoWindow:
 
         self.pipeline = Gst.parse_launch(pipeline_str)
         self.overlay = self.pipeline.get_by_name("overlay")
+        self.fc_canvas = self.pipeline.get_by_name("fc_canvas")
         self.video_sink = self.pipeline.get_by_name("videosink")
         self.monitor_sink = self.pipeline.get_by_name("monitorsink")
 
@@ -1380,7 +1494,10 @@ class UdpVideoWindow:
             raise RuntimeError("Не вдалося знайти monitorsink")
         if self.overlay is None:
             raise RuntimeError("Не вдалося знайти textoverlay")
+        if self.fc_canvas is None:
+            raise RuntimeError("Не вдалося знайти cairooverlay fc_canvas")
 
+        self.fc_canvas.connect("draw", self.on_fc_canvas_draw)
         self.monitor_sink.connect("new-sample", self.on_monitor_new_sample)
 
         video_widget = self.video_sink.props.widget
@@ -1717,7 +1834,7 @@ class UdpVideoWindow:
         if color is not None:
             self.set_overlay_color(color)
 
-        if not force and not self.enable_telemetry_osd:
+        if not force and not self.enable_telemetry_osd and not (self.fc_telemetry_enabled and self.fc_telemetry_show_osd):
             text = ""
 
         GLib.idle_add(self.overlay.set_property, "text", text)
@@ -1741,6 +1858,7 @@ class UdpVideoWindow:
 
         self.pipeline = None
         self.overlay = None
+        self.fc_canvas = None
         self.video_sink = None
         self.monitor_sink = None
         self.bus = None
@@ -1948,10 +2066,219 @@ class UdpVideoWindow:
 
         return True
 
+
+    def fc_set_status(self, text: str):
+        with self.fc_lock:
+            self.fc_status_text = text
+
+    def fc_clear_back_matrix(self):
+        self.fc_back_matrix = [0] * (FC_OSD_COLS * FC_OSD_ROWS)
+        self.fc_back_has_content = False
+
+    def fc_write_osd_bytes(self, row: int, col: int, data_bytes: bytes):
+        if row >= FC_OSD_ROWS or col >= FC_OSD_COLS:
+            return
+        base_idx = row * FC_OSD_COLS + col
+        for i, b in enumerate(data_bytes):
+            if col + i >= FC_OSD_COLS:
+                break
+            self.fc_back_matrix[base_idx + i] = b
+        self.fc_back_has_content = True
+
+    def fc_commit_frame(self):
+        if not self.fc_back_has_content:
+            return
+        with self.fc_lock:
+            self.fc_matrix = list(self.fc_back_matrix)
+            self.fc_last_text = self.fc_matrix_to_text(self.fc_matrix)
+            self.fc_status_text = "FC telemetry: OK"
+            self.fc_last_packet_time = time.time()
+        self.fc_clear_back_matrix()
+        self.update_fc_overlay_text()
+
+    def fc_matrix_to_text(self, matrix: List[int]) -> str:
+        lines = []
+        for row in range(FC_OSD_ROWS):
+            start = row * FC_OSD_COLS
+            raw_line = "".join(decode_fc_osd_byte(x) for x in matrix[start:start + FC_OSD_COLS])
+            line = raw_line.rstrip()
+            if line.strip():
+                lines.append(line)
+        return "\n".join(lines[-8:])
+
+    def update_fc_overlay_text(self):
+        # FC telemetry is drawn by cairooverlay with font_btfl_hd.png.
+        # Do not push it into GStreamer textoverlay, otherwise the 50x18 OSD grid
+        # turns into proportional text and shifts/crops on the right side.
+        if self.fc_canvas is not None:
+            try:
+                GLib.idle_add(self.fc_canvas.queue_draw)
+            except Exception:
+                pass
+        return False
+
+    def on_fc_canvas_draw(self, _overlay, context, _timestamp, _duration):
+        if not self.fc_telemetry_enabled or not self.fc_telemetry_show_osd:
+            return
+        if self.fc_font_surface is None:
+            return
+
+        target = context.get_target()
+        width = target.get_width()
+        height = target.get_height()
+        if width <= 0 or height <= 0:
+            return
+
+        with self.fc_lock:
+            matrix = list(self.fc_matrix)
+
+        scale_x = width * FC_OSD_SCALE / (FC_OSD_COLS * FC_FONT_CHAR_WIDTH)
+        scale_y = height * FC_OSD_SCALE / (FC_OSD_ROWS * FC_FONT_CHAR_HEIGHT)
+        offset_x = (width - FC_OSD_COLS * FC_FONT_CHAR_WIDTH * scale_x) / 2
+        offset_y = (height - FC_OSD_ROWS * FC_FONT_CHAR_HEIGHT * scale_y) / 2
+
+        context.save()
+        context.reset_clip()
+        context.rectangle(0, 0, width, height)
+        context.clip()
+        context.translate(offset_x, offset_y)
+        context.scale(scale_x, scale_y)
+        context.set_operator(cairo.Operator.OVER)
+
+        for row in range(FC_OSD_ROWS):
+            for col in range(FC_OSD_COLS):
+                char_index = matrix[row * FC_OSD_COLS + col]
+                if char_index == 0 or char_index == 32:
+                    continue
+                dst_x = col * FC_FONT_CHAR_WIDTH
+                dst_y = row * FC_FONT_CHAR_HEIGHT
+                src_y = char_index * FC_FONT_CHAR_HEIGHT
+                context.set_source_surface(self.fc_font_surface, dst_x, dst_y - src_y)
+                context.rectangle(dst_x, dst_y, FC_FONT_CHAR_WIDTH, FC_FONT_CHAR_HEIGHT)
+                context.fill()
+
+        context.restore()
+
+    def parse_fc_msp_stream_bytes(self, data: bytes, parser_state: dict):
+        for byte in data:
+            state = parser_state.get("state", 0)
+            if state == 0:
+                parser_state["state"] = 1 if byte == 0x24 else 0
+            elif state == 1:
+                parser_state["state"] = 2 if byte == 0x4D else 0
+            elif state == 2:
+                parser_state["state"] = 3 if byte == 0x3E else 0
+            elif state == 3:
+                parser_state["payload_len"] = byte
+                parser_state["checksum"] = byte
+                parser_state["state"] = 4
+            elif state == 4:
+                parser_state["cmd_id"] = byte
+                parser_state["checksum"] ^= byte
+                parser_state["payload"] = bytearray()
+                parser_state["state"] = 5 if parser_state["payload_len"] == 0 else 6
+            elif state == 6:
+                parser_state["payload"].append(byte)
+                parser_state["checksum"] ^= byte
+                if len(parser_state["payload"]) == parser_state["payload_len"]:
+                    parser_state["state"] = 5
+            elif state == 5:
+                # byte is checksum. The sample code did not validate checksum; here we validate softly.
+                if (parser_state.get("checksum", 0) & 0xFF) == byte:
+                    self.handle_fc_msp_packet(parser_state.get("cmd_id", 0), bytes(parser_state.get("payload", b"")))
+                parser_state.clear()
+                parser_state["state"] = 0
+
+    def handle_fc_msp_packet(self, cmd_id: int, payload: bytes):
+        if cmd_id != FC_MSP_DISPLAYPORT or not payload:
+            return
+
+        sub_cmd = payload[0]
+        if sub_cmd == FC_SUBCMD_CLEAR:
+            self.fc_clear_back_matrix()
+        elif sub_cmd == FC_SUBCMD_WRITE and len(payload) >= 5:
+            row = payload[1]
+            col = payload[2]
+            # payload[3] is usually attribute/flags, payload[4:] is text bytes.
+            self.fc_write_osd_bytes(row, col, payload[4:])
+        elif sub_cmd == FC_SUBCMD_DRAW:
+            self.fc_commit_frame()
+
+    def fc_telemetry_loop(self):
+        parser_state = {"state": 0}
+        sock = None
+        last_heartbeat_time = 0.0
+        last_status_report = 0.0
+
+        while self.running:
+            if not self.fc_telemetry_enabled:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = None
+                time.sleep(0.3)
+                continue
+
+            try:
+                host = self.fc_telemetry_host.strip()
+                port = int(self.fc_telemetry_port)
+                if not host or port <= 0:
+                    self.fc_set_status("FC telemetry: не задано host/port")
+                    GLib.idle_add(self.update_fc_overlay_text)
+                    time.sleep(1.0)
+                    continue
+
+                if sock is None or self.fc_reconnect_requested:
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.settimeout(0.1)
+                    self.fc_reconnect_requested = False
+                    parser_state = {"state": 0}
+                    self.fc_set_status(f"FC telemetry: підключення {host}:{port}")
+                    GLib.idle_add(self.update_fc_overlay_text)
+
+                now = time.time()
+                if now - last_heartbeat_time >= self.fc_telemetry_heartbeat_interval:
+                    # Same heartbeat as in the working example: MSP_DISPLAYPORT request.
+                    sock.sendto(build_fc_msp_request(FC_MSP_DISPLAYPORT, b"\x00"), (host, port))
+                    last_heartbeat_time = now
+
+                try:
+                    chunk, _ = sock.recvfrom(4096)
+                    if chunk:
+                        self.parse_fc_msp_stream_bytes(chunk, parser_state)
+                except socket.timeout:
+                    pass
+
+                with self.fc_lock:
+                    last_packet = self.fc_last_packet_time
+                if last_packet > 0 and now - last_packet > self.fc_telemetry_stale_timeout:
+                    if now - last_status_report > 1.0:
+                        self.fc_set_status("FC telemetry: немає свіжих даних")
+                        GLib.idle_add(self.update_fc_overlay_text)
+                        last_status_report = now
+
+            except Exception as e:
+                self.fc_set_status(f"FC telemetry ERROR: {type(e).__name__}")
+                GLib.idle_add(self.update_fc_overlay_text)
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = None
+                time.sleep(1.0)
+
     def poll_mikrotik_loop(self):
         while self.running:
             try:
-                if not self.enable_telemetry_osd:
+                if not self.enable_telemetry_osd or (self.fc_telemetry_enabled and self.fc_telemetry_show_osd):
                     time.sleep(self.poll_interval)
                     continue
 
@@ -2369,6 +2696,59 @@ StartupWMClass={APP_ID}
         osd_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(osd_page, Gtk.Label(label="OSD"))
 
+        fc_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        fc_page.set_border_width(8)
+
+        fc_info_frame, fc_info_grid = self.make_section("Пояснення")
+        fc_info_label = Gtk.Label(
+            label=(
+                "Ця вкладка читає MSP DisplayPort телеметрію з польотника через UDP.\n"
+                "Вона незалежна від вкладки MikroTik / SFP. Для роботи камера має форвардити MSP з UART польотника на UDP порт."
+            )
+        )
+        fc_info_label.set_xalign(0.0)
+        fc_info_label.set_line_wrap(True)
+        fc_info_grid.attach(fc_info_label, 0, 0, 2, 1)
+
+        fc_enable_frame, fc_enable_grid = self.make_section("Увімкнення")
+        chk_fc_telemetry_enabled = Gtk.CheckButton(label="Увімкнути телеметрію з польотника")
+        chk_fc_telemetry_enabled.set_active(self.fc_telemetry_enabled)
+        fc_enable_grid.attach(chk_fc_telemetry_enabled, 0, 0, 2, 1)
+
+        chk_fc_telemetry_show_osd = Gtk.CheckButton(label="Показувати телеметрію польотника в OSD")
+        chk_fc_telemetry_show_osd.set_active(self.fc_telemetry_show_osd)
+        fc_enable_grid.attach(chk_fc_telemetry_show_osd, 0, 1, 2, 1)
+
+        fc_udp_frame, fc_udp_grid = self.make_section("UDP MSP")
+        entry_fc_host = Gtk.Entry()
+        entry_fc_host.set_text(self.fc_telemetry_host)
+        self.add_labeled_row(fc_udp_grid, 0, "Host камери:", entry_fc_host)
+
+        spin_fc_port = Gtk.SpinButton()
+        spin_fc_port.set_range(1, 65535)
+        spin_fc_port.set_value(self.fc_telemetry_port)
+        self.add_labeled_row(fc_udp_grid, 1, "UDP порт MSP:", spin_fc_port)
+
+        spin_fc_heartbeat = Gtk.SpinButton()
+        spin_fc_heartbeat.set_range(0.1, 10.0)
+        spin_fc_heartbeat.set_digits(1)
+        spin_fc_heartbeat.set_increments(0.1, 0.5)
+        spin_fc_heartbeat.set_value(self.fc_telemetry_heartbeat_interval)
+        self.add_labeled_row(fc_udp_grid, 2, "Інтервал запиту, сек:", spin_fc_heartbeat)
+
+        spin_fc_stale = Gtk.SpinButton()
+        spin_fc_stale.set_range(0.5, 30.0)
+        spin_fc_stale.set_digits(1)
+        spin_fc_stale.set_increments(0.5, 1.0)
+        spin_fc_stale.set_value(self.fc_telemetry_stale_timeout)
+        self.add_labeled_row(fc_udp_grid, 3, "Таймаут даних, сек:", spin_fc_stale)
+
+        fc_page.pack_start(fc_info_frame, False, False, 0)
+        fc_page.pack_start(fc_enable_frame, False, False, 0)
+        fc_page.pack_start(fc_udp_frame, False, False, 0)
+        fc_page.pack_start(Gtk.Box(), True, True, 0)
+        notebook.append_page(fc_page, Gtk.Label(label="Польотник"))
+
         bridge_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         bridge_page.set_border_width(8)
 
@@ -2537,6 +2917,16 @@ StartupWMClass={APP_ID}
 
         chk_enable_telemetry_osd.connect("toggled", lambda *_: update_osd_widgets_state())
 
+        def update_fc_widgets_state():
+            enabled = chk_fc_telemetry_enabled.get_active()
+            chk_fc_telemetry_show_osd.set_sensitive(enabled)
+            entry_fc_host.set_sensitive(enabled)
+            spin_fc_port.set_sensitive(enabled)
+            spin_fc_heartbeat.set_sensitive(enabled)
+            spin_fc_stale.set_sensitive(enabled)
+
+        chk_fc_telemetry_enabled.connect("toggled", lambda *_: update_fc_widgets_state())
+
         def apply_profile_to_widgets(profile_data):
             nonlocal widgets_sync_in_progress
             widgets_sync_in_progress = True
@@ -2547,6 +2937,7 @@ StartupWMClass={APP_ID}
                 bridge = profile_data["bridge"]
                 video = profile_data["video"]
                 mikrotik = profile_data["mikrotik"]
+                fc_telemetry = profile_data["fc_telemetry"]
 
                 chk_enable_telemetry_osd.set_active(osd["enabled"])
                 spin_x.set_value(osd["xpad"])
@@ -2592,7 +2983,15 @@ StartupWMClass={APP_ID}
                 entry_mt_password.set_text(mikrotik["password"])
                 entry_mt_if.set_text(mikrotik["interface"])
 
+                chk_fc_telemetry_enabled.set_active(fc_telemetry["enabled"])
+                chk_fc_telemetry_show_osd.set_active(fc_telemetry["show_osd"])
+                entry_fc_host.set_text(fc_telemetry["host"])
+                spin_fc_port.set_value(fc_telemetry["port"])
+                spin_fc_heartbeat.set_value(fc_telemetry["heartbeat_interval"])
+                spin_fc_stale.set_value(fc_telemetry["stale_timeout"])
+
                 update_osd_widgets_state()
+                update_fc_widgets_state()
             finally:
                 widgets_sync_in_progress = False
 
@@ -2638,6 +3037,14 @@ StartupWMClass={APP_ID}
                         "password": entry_mt_password.get_text(),
                         "interface": entry_mt_if.get_text().strip(),
                     },
+                    "fc_telemetry": {
+                        "enabled": chk_fc_telemetry_enabled.get_active(),
+                        "show_osd": chk_fc_telemetry_show_osd.get_active(),
+                        "host": entry_fc_host.get_text().strip(),
+                        "port": spin_fc_port.get_value_as_int(),
+                        "heartbeat_interval": spin_fc_heartbeat.get_value(),
+                        "stale_timeout": spin_fc_stale.get_value(),
+                    },
                 }
             )
 
@@ -2661,6 +3068,14 @@ StartupWMClass={APP_ID}
                 self.mikrotik_user,
                 self.mikrotik_password,
                 self.mikrotik_interface,
+            )
+            prev_fc_telemetry_state = (
+                self.fc_telemetry_enabled,
+                self.fc_telemetry_show_osd,
+                self.fc_telemetry_host,
+                self.fc_telemetry_port,
+                self.fc_telemetry_heartbeat_interval,
+                self.fc_telemetry_stale_timeout,
             )
 
             self.active_profile_id = selected_profile_id
@@ -2694,6 +3109,22 @@ StartupWMClass={APP_ID}
             )
             mikrotik_changed = mikrotik_state != prev_mikrotik_state
 
+            fc_telemetry_state = (
+                self.fc_telemetry_enabled,
+                self.fc_telemetry_show_osd,
+                self.fc_telemetry_host,
+                self.fc_telemetry_port,
+                self.fc_telemetry_heartbeat_interval,
+                self.fc_telemetry_stale_timeout,
+            )
+            fc_telemetry_changed = fc_telemetry_state != prev_fc_telemetry_state
+            if fc_telemetry_changed:
+                with self.fc_lock:
+                    self.fc_last_text = ""
+                    self.fc_status_text = "FC: очікування телеметрії..." if self.fc_telemetry_enabled else "FC telemetry: вимкнено"
+                    self.fc_last_packet_time = 0.0
+                self.fc_reconnect_requested = True
+
             if not self.enable_telemetry_osd:
                 self.disable_mikrotik_runtime()
 
@@ -2701,7 +3132,10 @@ StartupWMClass={APP_ID}
                 self.restart_video_pipeline()
             else:
                 self.apply_overlay_visual_settings()
-                if self.enable_telemetry_osd:
+                if self.fc_telemetry_enabled and self.fc_telemetry_show_osd:
+                    self.update_fc_overlay_text()
+                    GLib.idle_add(self.refresh_video_area)
+                elif self.enable_telemetry_osd:
                     if not prev_enable_telemetry_osd:
                         self.set_overlay_text(
                             "STATUS: Підключення до MikroTik...",
@@ -2715,7 +3149,7 @@ StartupWMClass={APP_ID}
             if bridge_changed:
                 self.restart_bridge()
 
-            if self.enable_telemetry_osd:
+            if self.enable_telemetry_osd and not (self.fc_telemetry_enabled and self.fc_telemetry_show_osd):
                 if mikrotik_changed or (prev_enable_telemetry_osd != self.enable_telemetry_osd):
                     self.request_mikrotik_reconnect()
 
@@ -2776,6 +3210,12 @@ StartupWMClass={APP_ID}
             entry_mt_user,
             entry_mt_password,
             entry_mt_if,
+            chk_fc_telemetry_enabled,
+            chk_fc_telemetry_show_osd,
+            entry_fc_host,
+            spin_fc_port,
+            spin_fc_heartbeat,
+            spin_fc_stale,
         ]
 
         for watched_widget in widgets_to_watch:

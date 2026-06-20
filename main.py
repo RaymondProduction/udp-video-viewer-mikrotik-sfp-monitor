@@ -1132,9 +1132,49 @@ class UdpVideoWindow:
             "video": {
                 "port": 5600,
                 "mode": "rtp",
-                "decoder": DEFAULT_VIDEO_DECODER,
+                "decoder": "decodebin",
                 "always_on_top": True,
-                "modes": [],
+                "modes": [
+                    {
+                        "name": "Low (512)",
+                        "min": 0,
+                        "max": 800,
+                        "bitrate": "512",
+                        "api_set": {
+                            "video0.fps": 25,
+                            "video0.bitrate": 512,
+                            "video0.gopSize": 0.12,
+                            "video0.qpDelta": -4,
+                            "saturation": 50,
+                        },
+                    },
+                    {
+                        "name": "Middle (1536)",
+                        "min": 801,
+                        "max": 1500,
+                        "bitrate": "1536",
+                        "api_set": {
+                            "video0.fps": 30,
+                            "video0.bitrate": 1536,
+                            "video0.gopSize": 0.067,
+                            "video0.qpDelta": -4,
+                            "saturation": 50,
+                        },
+                    },
+                    {
+                        "name": "High (3072)",
+                        "min": 1000,
+                        "max": 2000,
+                        "bitrate": "3072",
+                        "api_set": {
+                            "video0.fps": 25,
+                            "video0.bitrate": 3072,
+                            "video0.gopSize": 0.12,
+                            "video0.qpDelta": -4,
+                            "saturation": 59,
+                        },
+                    },
+                ],
             },
             "mikrotik": {
                 "host": "192.168.121.1",
@@ -1156,7 +1196,7 @@ class UdpVideoWindow:
             },
         }
 
-    def get_vpn_profile_definition(self):
+    def get_starlink_profile_definition(self):
         return {
             "osd": {
                 "enabled": False,
@@ -1186,9 +1226,49 @@ class UdpVideoWindow:
             "video": {
                 "port": 5600,
                 "mode": "rtp",
-                "decoder": DEFAULT_VIDEO_DECODER,
+                "decoder": "decodebin",
                 "always_on_top": True,
-                "modes": [],
+                "modes": [
+                    {
+                        "name": "Low (512)",
+                        "min": 0,
+                        "max": 800,
+                        "bitrate": "512",
+                        "api_set": {
+                            "video0.fps": 25,
+                            "video0.bitrate": 512,
+                            "video0.gopSize": 0.12,
+                            "video0.qpDelta": -4,
+                            "saturation": 50,
+                        },
+                    },
+                    {
+                        "name": "Middle (1536)",
+                        "min": 801,
+                        "max": 1500,
+                        "bitrate": "1536",
+                        "api_set": {
+                            "video0.fps": 30,
+                            "video0.bitrate": 1536,
+                            "video0.gopSize": 0.067,
+                            "video0.qpDelta": -4,
+                            "saturation": 50,
+                        },
+                    },
+                    {
+                        "name": "High (3072)",
+                        "min": 1000,
+                        "max": 2000,
+                        "bitrate": "3072",
+                        "api_set": {
+                            "video0.fps": 25,
+                            "video0.bitrate": 3072,
+                            "video0.gopSize": 0.12,
+                            "video0.qpDelta": -4,
+                            "saturation": 59,
+                        },
+                    },
+                ],
             },
             "mikrotik": {
                 "host": "192.168.1.1",
@@ -1197,14 +1277,14 @@ class UdpVideoWindow:
                 "interface": "sfp1",
             },
             "fc_telemetry": {
-                "enabled": False,
+                "enabled": True,
                 "show_osd": True,
                 "host": "192.168.32.3",
                 "port": 9001,
                 "heartbeat_interval": 0.4,
                 "stale_timeout": 2.0,
                 "show_aux": True,
-                "aux_channel": -1,
+                "aux_channel": 6,
                 "aux_row": 0,
                 "aux_col": 0,
             },
@@ -1213,7 +1293,7 @@ class UdpVideoWindow:
     def get_builtin_profiles(self):
         return {
             "default": self.get_default_profile_definition(),
-            "vpn": self.get_vpn_profile_definition(),
+            "starlink": self.get_starlink_profile_definition(),
             "custom": self.get_default_profile_definition(),
         }
 
@@ -1449,9 +1529,17 @@ class UdpVideoWindow:
 
             if isinstance(data, dict) and isinstance(data.get("profiles"), dict):
                 active_profile_id = str(data.get("active_profile", "default")).lower()
+                if active_profile_id == "vpn":
+                    active_profile_id = "starlink"
                 profiles = {}
                 for profile_id, profile_data in builtin_profiles.items():
-                    saved_profile = data.get("profiles", {}).get(profile_id, profile_data)
+                    if profile_id == "starlink":
+                        saved_profile = data.get("profiles", {}).get(
+                            "starlink",
+                            data.get("profiles", {}).get("vpn", profile_data),
+                        )
+                    else:
+                        saved_profile = data.get("profiles", {}).get(profile_id, profile_data)
                     profiles[profile_id] = self.normalize_profile_data(saved_profile)
                 extra_custom = data.get("profiles", {}).get("custom")
                 if extra_custom is not None:
@@ -1486,8 +1574,8 @@ class UdpVideoWindow:
                 "default": self.normalize_profile_data(
                     self.profiles_storage.get("default", self.get_default_profile_definition())
                 ),
-                "vpn": self.normalize_profile_data(
-                    self.profiles_storage.get("vpn", self.get_vpn_profile_definition())
+                "starlink": self.normalize_profile_data(
+                    self.profiles_storage.get("starlink", self.get_starlink_profile_definition())
                 ),
                 "custom": self.normalize_profile_data(
                     self.profiles_storage.get("custom", self.get_default_profile_definition())
@@ -3247,7 +3335,7 @@ StartupWMClass={APP_ID}
         profile_frame, profile_grid = self.make_section("Профіль")
         combo_profile = Gtk.ComboBoxText()
         combo_profile.append("default", "Default — локальна мережа 192.168.121.x")
-        combo_profile.append("vpn", "VPN — WireGuard / 192.168.32.x")
+        combo_profile.append("starlink", "Starlink (VPN WireGuard) — 192.168.32.x")
         combo_profile.append("custom", "Custom — змінений вручну")
         combo_profile.set_active_id(getattr(self, "active_profile_id", "default"))
         self.add_labeled_row(profile_grid, 0, "Активний профіль:", combo_profile)

@@ -888,8 +888,9 @@ class UdpVideoWindow:
         self.btn_fullscreen.connect("clicked", self.on_fullscreen_button_clicked)
         self.top_bar.pack_start(self.btn_fullscreen, False, False, 0)
 
-        self.btn_restart_mj = Gtk.Button(label="Restart MJ")
-        self.btn_restart_mj.set_tooltip_text("Перезапуск Majestic")
+        self.btn_restart_mj = Gtk.Button()
+        self.btn_restart_mj.set_image(Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON))
+        self.btn_restart_mj.set_tooltip_text("Оновити відеопотік")
         self.btn_restart_mj.connect("clicked", self.on_restart_majestic_clicked)
         self.top_bar.pack_start(self.btn_restart_mj, False, False, 0)
 
@@ -1775,7 +1776,7 @@ class UdpVideoWindow:
                         not self.majestic_stream_recovery_attempted
                         and now >= self.majestic_stream_deadline
                     ):
-                        print("[INFO] Після Restart MJ кадри не з'явилися, перезапускаю відеопайплайн", flush=True)
+                        print("[INFO] Після refresh кадри не з'явилися, перезапускаю відеопайплайн", flush=True)
                         self.majestic_stream_recovery_attempted = True
                         GLib.idle_add(self.restart_video_pipeline_safe)
 
@@ -1824,11 +1825,11 @@ class UdpVideoWindow:
             now = time.time()
 
             if self.majestic_restart_in_progress:
-                print("[INFO] Majestic restart already in progress", flush=True)
+                print("[INFO] API restart already in progress", flush=True)
                 return
 
             if now - self.majestic_restart_last_time < self.majestic_restart_debounce_sec:
-                print("[INFO] Majestic restart debounce: click ignored", flush=True)
+                print("[INFO] API restart debounce: click ignored", flush=True)
                 return
 
             self.majestic_restart_in_progress = True
@@ -1837,42 +1838,36 @@ class UdpVideoWindow:
         if not host:
             with self.majestic_restart_lock:
                 self.majestic_restart_in_progress = False
-            print("[ERROR] Majestic restart failed: bridge_remote_host is empty", file=sys.stderr)
+            print("[ERROR] API restart failed: bridge_remote_host is empty", file=sys.stderr)
             return
 
         GLib.idle_add(self.set_restart_majestic_button_enabled, False)
 
         def worker():
             try:
-                user = self.bridge_http_user or get_default_majestic_user()
-                password = self.bridge_http_password or get_default_majestic_password()
+                user = self.bridge_http_user or ""
+                password = self.bridge_http_password or ""
+                url = f"http://{host}/api/v1/restart"
 
-                auth = base64.b64encode(f"{user}:{password}".encode()).decode()
-                url = f"http://{host}/cgi-bin/mj-settings.cgi"
-                data = urllib.parse.urlencode({"action": "restart"}).encode("utf-8")
+                headers = {}
+                if user or password:
+                    auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+                    headers["Authorization"] = f"Basic {auth}"
 
-                req = urllib.request.Request(
-                    url,
-                    data=data,
-                    method="POST",
-                    headers={
-                        "Authorization": f"Basic {auth}",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
-                )
+                req = urllib.request.Request(url, method="GET", headers=headers)
 
                 context = ssl._create_unverified_context()
 
                 with urllib.request.urlopen(req, timeout=5, context=context) as resp:
                     body = resp.read().decode("utf-8", errors="ignore")
-                    print(f"[INFO] Majestic restart sent to {host}, HTTP {resp.status}", flush=True)
+                    print(f"[INFO] Restart request sent to {url}, HTTP {resp.status}", flush=True)
                     if body:
-                        print(f"[INFO] Majestic response: {body[:300]}", flush=True)
+                        print(f"[INFO] Restart response: {body[:300]}", flush=True)
 
                 GLib.idle_add(self.begin_waiting_for_majestic_stream)
 
             except Exception as e:
-                print(f"[ERROR] Majestic restart failed: {e}", file=sys.stderr)
+                print(f"[ERROR] API restart failed: {e}", file=sys.stderr)
 
             finally:
                 GLib.idle_add(self.finish_restart_majestic_request)
@@ -3575,20 +3570,9 @@ StartupWMClass={APP_ID}
         spin_local_bind_port.set_value(self.bridge_local_bind_port)
         self.add_labeled_row(grid_udp, 3, "Локальний bind порт:", spin_local_bind_port)
 
-        frame_http_auth, grid_http_auth = self.make_section("Majestic HTTP авторизація")
-        entry_bridge_http_user = Gtk.Entry()
-        entry_bridge_http_user.set_text(self.bridge_http_user)
-        self.add_labeled_row(grid_http_auth, 0, "Логін Majestic:", entry_bridge_http_user)
-
-        entry_bridge_http_password = Gtk.Entry()
-        entry_bridge_http_password.set_visibility(False)
-        entry_bridge_http_password.set_text(self.bridge_http_password)
-        self.add_labeled_row(grid_http_auth, 1, "Пароль Majestic:", entry_bridge_http_password)
-
         bridge_page.pack_start(hint_frame, False, False, 0)
         bridge_page.pack_start(frame_serial, False, False, 0)
         bridge_page.pack_start(frame_udp, False, False, 0)
-        bridge_page.pack_start(frame_http_auth, False, False, 0)
         bridge_page.pack_start(Gtk.Box(), True, True, 0)
 
         logs_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -4002,8 +3986,6 @@ StartupWMClass={APP_ID}
                 spin_remote_port.set_value(bridge["remote_port"])
                 entry_local_bind_ip.set_text(bridge["local_bind_ip"])
                 spin_local_bind_port.set_value(bridge["local_bind_port"])
-                entry_bridge_http_user.set_text(bridge["http_user"])
-                entry_bridge_http_password.set_text(bridge["http_password"])
                 chk_bridge_verbose.set_active(bridge["verbose"])
                 chk_bridge_hex.set_active(bridge["hex"])
 
@@ -4061,8 +4043,8 @@ StartupWMClass={APP_ID}
                         "local_bind_port": spin_local_bind_port.get_value_as_int(),
                         "verbose": chk_bridge_verbose.get_active(),
                         "hex": chk_bridge_hex.get_active(),
-                        "http_user": entry_bridge_http_user.get_text().strip() or get_default_majestic_user(),
-                        "http_password": entry_bridge_http_password.get_text() or get_default_majestic_password(),
+                        "http_user": self.bridge_http_user or get_default_majestic_user(),
+                        "http_password": self.bridge_http_password or get_default_majestic_password(),
                     },
                     "video": {
                         "port": spin_video_port.get_value_as_int(),
@@ -4253,8 +4235,6 @@ StartupWMClass={APP_ID}
             spin_remote_port,
             entry_local_bind_ip,
             spin_local_bind_port,
-            entry_bridge_http_user,
-            entry_bridge_http_password,
             chk_bridge_verbose,
             chk_bridge_hex,
             spin_video_port,

@@ -1279,7 +1279,21 @@ class UdpVideoWindow:
                 "aux_channel": int(fc_telemetry.get("aux_channel", defaults["fc_telemetry"].get("aux_channel", -1))),
                 "aux_row": int(fc_telemetry.get("aux_row", defaults["fc_telemetry"].get("aux_row", 0))),
                 "aux_col": int(fc_telemetry.get("aux_col", defaults["fc_telemetry"].get("aux_col", 0))),
-                "aux_bitrate_map": [m for m in fc_telemetry.get("aux_bitrate_map", []) if isinstance(m, dict) and "min" in m and "max" in m and "bitrate" in m],
+                "aux_bitrate_map": [
+                    {
+                        **m,
+                        "bitrate": str(
+                            m.get("bitrate", "")
+                            or (
+                                m.get("api_set", {}).get("video0.bitrate", "")
+                                if isinstance(m.get("api_set"), dict)
+                                else ""
+                            )
+                        ),
+                    }
+                    for m in fc_telemetry.get("aux_bitrate_map", [])
+                    if isinstance(m, dict) and "min" in m and "max" in m
+                ],
             },
         }
 
@@ -2128,11 +2142,15 @@ class UdpVideoWindow:
         with self.fc_lock:
             aux_map = self.fc_aux_bitrate_map or []
         for mapping in aux_map:
-            if "min" in mapping and "max" in mapping and "bitrate" in mapping:
+            if "min" in mapping and "max" in mapping:
                 min_val = int(mapping.get("min", 0))
                 max_val = int(mapping.get("max", 0))
                 if min_val <= aux_value <= max_val:
-                    return str(mapping.get("bitrate", ""))
+                    bitrate = mapping.get("bitrate", "")
+                    if not bitrate and isinstance(mapping.get("api_set"), dict):
+                        bitrate = mapping.get("api_set", {}).get("video0.bitrate", "")
+                    if bitrate:
+                        return str(bitrate)
         return str(aux_value)
 
     def fc_get_aux_mode_mapping(self, aux_value: int) -> Tuple[str, Optional[Dict[str, Any]]]:
@@ -3301,8 +3319,6 @@ StartupWMClass={APP_ID}
         right_col.pack_start(frame_data, False, False, 0)
         right_col.pack_start(Gtk.Box(), True, True, 0)
 
-        notebook.append_page(mt_osd_page, Gtk.Label(label="MikroTik / SFP"))
-
         fc_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         fc_page.set_border_width(8)
 
@@ -3359,23 +3375,22 @@ StartupWMClass={APP_ID}
         fc_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(fc_page, Gtk.Label(label="Польотник"))
 
-        video_modes_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        video_modes_page = Gtk.Grid()
         video_modes_page.set_border_width(8)
+        video_modes_page.set_row_spacing(10)
+        video_modes_page.set_column_spacing(12)
         video_modes_page.set_hexpand(True)
         video_modes_page.set_vexpand(True)
 
-        video_modes_left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        video_modes_left.set_hexpand(True)
-        video_modes_left.set_vexpand(True)
-        video_modes_page.pack_start(video_modes_left, True, True, 0)
+        video_modes_page.set_column_homogeneous(True)
+        video_modes_page.set_column_homogeneous(True)
 
         video_modes_info_frame, video_modes_info_grid = self.make_section("Пояснення")
         video_modes_info_label = Gtk.Label(
             label=(
-                "Відеорежими — майбутні профілі картинки, які пізніше можна буде перемикати з пульта. "
-                "Зараз перемикання ще не реалізоване: програма лише перехоплює вибраний AUX з CRSF-потоку "
-                "і акуратно показує його поверх клієнтського OSD, не змінюючи основне OSD польотника.\n\n"
-                "Приклади назв режимів: Низька затримка, Дальність, Якість, Ніч."
+                "Цей розділ керує автоматичним перемиканням відеорежимів камери за сигналом AUX з пульта.\n\n"
+                "Оберіть канал AUX і задайте позицію індикатора на OSD.\n"
+                "Для кожного режиму вкажіть назву, діапазон AUX і параметри камери через кнопку ⚙."
             )
         )
         video_modes_info_label.set_xalign(0.0)
@@ -3405,30 +3420,30 @@ StartupWMClass={APP_ID}
         spin_fc_aux_col.set_value(self.fc_aux_col)
         self.add_labeled_row(video_modes_aux_grid, 3, "Колонка OSD:", spin_fc_aux_col)
 
-        # Bitrate/profile mapping table
-        aux_bitrate_map_frame, aux_bitrate_map_grid = self.make_section("Таблиця AUX → Відеорежим")
+        # Video mode mapping table
+        aux_bitrate_map_frame, aux_bitrate_map_grid = self.make_section("Відеорежими")
         aux_bitrate_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
         # Scrollable area for mappings
+        # Add button at TOP of modes list
+        button_add_bitrate = Gtk.Button(label="+ Додати відео режим")
+        button_add_bitrate.set_hexpand(True)
+        aux_bitrate_container.pack_start(button_add_bitrate, False, False, 0)
+
         aux_bitrate_scroll = Gtk.ScrolledWindow()
         aux_bitrate_scroll.set_hexpand(True)
-        aux_bitrate_scroll.set_vexpand(False)
-        aux_bitrate_scroll.set_min_content_height(120)
+        aux_bitrate_scroll.set_vexpand(True)
+        aux_bitrate_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         aux_bitrate_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         aux_bitrate_scroll.add(aux_bitrate_list_box)
         aux_bitrate_container.pack_start(aux_bitrate_scroll, True, True, 0)
 
-        # Add button
-        button_add_bitrate = Gtk.Button(label="+ Додати відео режим")
-        button_add_bitrate.set_hexpand(False)
-        aux_bitrate_container.pack_start(button_add_bitrate, False, False, 0)
-
         aux_bitrate_map_grid.attach(aux_bitrate_container, 0, 0, 2, 1)
-        video_modes_aux_grid.attach(aux_bitrate_map_frame, 0, 4, 2, 1)
 
-        video_modes_left.pack_start(video_modes_info_frame, False, False, 0)
-        video_modes_left.pack_start(video_modes_aux_frame, False, False, 0)
-        video_modes_left.pack_start(Gtk.Box(), True, True, 0)
+        video_modes_page.attach(video_modes_info_frame, 0, 0, 1, 1)
+        video_modes_page.attach(video_modes_aux_frame, 1, 0, 1, 1)
+        video_modes_page.attach(aux_bitrate_map_frame, 0, 1, 2, 1)
+        aux_bitrate_map_frame.set_hexpand(True)
         notebook.append_page(video_modes_page, Gtk.Label(label="Відеорежими"))
 
         bridge_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -3549,6 +3564,7 @@ StartupWMClass={APP_ID}
         video_page.pack_start(frame_window_behavior, False, False, 0)
         video_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(video_page, Gtk.Label(label="Відеопотік"))
+        notebook.append_page(mt_osd_page, Gtk.Label(label="MikroTik / SFP"))
 
         widgets_sync_in_progress = False
         video_mode_rows: List[dict] = []
@@ -3557,6 +3573,10 @@ StartupWMClass={APP_ID}
             api_set = row_state.get("api_set") if isinstance(row_state.get("api_set"), dict) else {}
             count = len(api_set)
             row_state["params_label"].set_text(f"Параметрів: {count}")
+            # Also update gear button tooltip with count
+            btn = row_state.get("params_button")
+            if btn:
+                btn.set_tooltip_text(f"Параметрів: {count} — натисніть для редагування")
 
         def open_video_mode_params_dialog(row_state):
             existing = row_state.get("api_set") if isinstance(row_state.get("api_set"), dict) else {}
@@ -3613,7 +3633,7 @@ StartupWMClass={APP_ID}
             spin_bitrate = Gtk.SpinButton()
             spin_bitrate.set_range(64, 20000)
             spin_bitrate.set_increments(64, 256)
-            bitrate_text = row_state["bitrate"].get_text().strip()
+            bitrate_text = str(row_state.get("bitrate_value", "")).strip()
             bitrate_default = 2192
             if bitrate_text:
                 try:
@@ -3696,7 +3716,7 @@ StartupWMClass={APP_ID}
                     "video0.zoomY": round(spin_zoom_y.get_value(), 3),
                     "video0.framing": combo_framing.get_active_id() or "off",
                 }
-                row_state["bitrate"].set_text(str(spin_bitrate.get_value_as_int()))
+                row_state["bitrate_value"] = str(spin_bitrate.get_value_as_int())
                 update_row_params_label(row_state)
                 sync_aux_bitrate_map_from_rows(mark_custom=True)
             dialog_params.destroy()
@@ -3713,9 +3733,13 @@ StartupWMClass={APP_ID}
                         "name": row["name"].get_text().strip(),
                         "min": min_val,
                         "max": max_val,
-                        "bitrate": row["bitrate"].get_text().strip(),
                     }
                 )
+                bitrate_value = str(row.get("bitrate_value", "")).strip()
+                if not bitrate_value and isinstance(row.get("api_set"), dict):
+                    bitrate_value = str(row.get("api_set", {}).get("video0.bitrate", "")).strip()
+                if bitrate_value:
+                    aux_map[-1]["bitrate"] = bitrate_value
                 if isinstance(row.get("api_set"), dict):
                     aux_map[-1]["api_set"] = dict(row["api_set"])
             self.fc_aux_bitrate_map = aux_map
@@ -3731,36 +3755,39 @@ StartupWMClass={APP_ID}
             entry_name.set_placeholder_text("Назва")
             entry_name.set_text(str(mapping.get("name", f"Режим {len(video_mode_rows) + 1}")))
             entry_name.set_hexpand(True)
+            entry_name.set_width_chars(10)
 
             spin_min = Gtk.SpinButton()
             spin_min.set_range(0, 3000)
             spin_min.set_increments(1, 10)
             spin_min.set_value(int(mapping.get("min", 1000)))
+            spin_min.set_width_chars(4)
 
             spin_max = Gtk.SpinButton()
             spin_max.set_range(0, 3000)
             spin_max.set_increments(1, 10)
             spin_max.set_value(int(mapping.get("max", 2000)))
+            spin_max.set_width_chars(4)
 
-            entry_bitrate = Gtk.Entry()
-            entry_bitrate.set_placeholder_text("Бітрейт, напр. 8M")
-            entry_bitrate.set_text(str(mapping.get("bitrate", "")))
-            entry_bitrate.set_width_chars(10)
+            button_mode_params = Gtk.Button()
+            button_mode_params.set_image(
+                Gtk.Image.new_from_icon_name("emblem-system-symbolic", Gtk.IconSize.BUTTON)
+            )
+            button_mode_params.set_tooltip_text("Налаштувати параметри режиму")
+            label_params = Gtk.Label()  # hidden, used internally for tooltip tracking
+            label_aux_range = Gtk.Label(label=f"{spin_min.get_value_as_int()}..{spin_max.get_value_as_int()}")
+            label_aux_range.set_xalign(0.0)
+            button_remove_mode = Gtk.Button()
+            button_remove_mode.set_image(
+                Gtk.Image.new_from_icon_name("user-trash-symbolic", Gtk.IconSize.BUTTON)
+            )
+            button_remove_mode.set_relief(Gtk.ReliefStyle.NONE)
+            button_remove_mode.set_tooltip_text("Видалити режим")
 
-            button_mode_params = Gtk.Button(label="Параметри...")
-            label_params = Gtk.Label(label="Параметрів: 0")
-            label_params.set_xalign(0.0)
-            button_remove_mode = Gtk.Button(label="Видалити")
-
-            row_box.pack_start(Gtk.Label(label="Назва:"), False, False, 0)
             row_box.pack_start(entry_name, True, True, 0)
-            row_box.pack_start(Gtk.Label(label="AUX від:"), False, False, 0)
             row_box.pack_start(spin_min, False, False, 0)
-            row_box.pack_start(Gtk.Label(label="до:"), False, False, 0)
+            row_box.pack_start(Gtk.Label(label="-"), False, False, 0)
             row_box.pack_start(spin_max, False, False, 0)
-            row_box.pack_start(Gtk.Label(label="Бітрейт:"), False, False, 0)
-            row_box.pack_start(entry_bitrate, False, False, 0)
-            row_box.pack_start(label_params, False, False, 0)
             row_box.pack_start(button_mode_params, False, False, 0)
             row_box.pack_start(button_remove_mode, False, False, 0)
 
@@ -3769,18 +3796,25 @@ StartupWMClass={APP_ID}
                 "name": entry_name,
                 "min": spin_min,
                 "max": spin_max,
-                "bitrate": entry_bitrate,
+                "bitrate_value": str(mapping.get("bitrate", "")),
                 "api_set": mapping.get("api_set") if isinstance(mapping.get("api_set"), dict) else None,
                 "params_label": label_params,
+                "params_button": button_mode_params,
+                "aux_range_label": label_aux_range,
             }
             video_mode_rows.append(row_state)
             aux_bitrate_list_box.pack_start(row_box, False, False, 0)
             update_row_params_label(row_state)
 
             entry_name.connect("changed", lambda *_: sync_aux_bitrate_map_from_rows(mark_custom=True))
-            spin_min.connect("value-changed", lambda *_: sync_aux_bitrate_map_from_rows(mark_custom=True))
-            spin_max.connect("value-changed", lambda *_: sync_aux_bitrate_map_from_rows(mark_custom=True))
-            entry_bitrate.connect("changed", lambda *_: sync_aux_bitrate_map_from_rows(mark_custom=True))
+            def on_aux_range_changed(*_args):
+                row_state["aux_range_label"].set_text(
+                    f"{spin_min.get_value_as_int()}..{spin_max.get_value_as_int()}"
+                )
+                sync_aux_bitrate_map_from_rows(mark_custom=True)
+
+            spin_min.connect("value-changed", on_aux_range_changed)
+            spin_max.connect("value-changed", on_aux_range_changed)
             button_mode_params.connect("clicked", lambda *_: open_video_mode_params_dialog(row_state))
 
             def remove_row(_button):
@@ -3802,7 +3836,7 @@ StartupWMClass={APP_ID}
             for mapping in mappings or []:
                 if not isinstance(mapping, dict):
                     continue
-                if not all(k in mapping for k in ("min", "max", "bitrate")):
+                if not all(k in mapping for k in ("min", "max")):
                     continue
                 add_video_mode_row(mapping, mark_custom=False)
 
@@ -3816,7 +3850,6 @@ StartupWMClass={APP_ID}
                     "name": f"Режим {len(video_mode_rows) + 1}",
                     "min": 1000,
                     "max": 2000,
-                    "bitrate": "",
                 },
                 mark_custom=True,
             ),

@@ -2598,8 +2598,13 @@ class UdpVideoWindow:
             # (usually rendered as something like 50MBPS / 5.0MBPS). If the field is
             # not present in the current BF OSD profile, we fall back to the configured
             # row/column from the Video Modes settings.
-            display_value = self.fc_get_aux_bitrate_display_value(selected_aux_value)
-            aux_text = f"AUX{self.fc_aux_channel_index - 3}:{display_value}"
+            _mode_key, _mode_mapping = self.fc_get_aux_mode_mapping(selected_aux_value)
+            if _mode_mapping is not None:
+                mode_name = str(_mode_mapping.get("name", "")).strip()
+            else:
+                mode_name = ""
+            display_value = mode_name if mode_name else str(selected_aux_value)
+            aux_text = display_value
             if not self.fc_replace_bitrate_field_with_text(matrix, aux_text):
                 self.fc_put_ascii_text(matrix, self.fc_aux_row, self.fc_aux_col, aux_text)
 

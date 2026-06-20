@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 import ssl
 from pathlib import Path
-from typing import Optional, List, Tuple, Callable
+from typing import Optional, List, Tuple, Callable, Dict, Any
 
 import gi
 import paramiko
@@ -827,6 +827,10 @@ class UdpVideoWindow:
         self.selected_aux_last_time = 0.0
         self.fc_canvas = None
         self.fc_font_surface = None
+        self.fc_last_aux_mode_key = ""
+        self.fc_last_aux_apply_ts = 0.0
+        self.fc_aux_apply_min_interval_sec = 0.8
+        self.fc_aux_apply_lock = threading.Lock()
         fc_font_path = first_existing_path([
             resource_path(FC_FONT_FILE),
             Path(__file__).resolve().parent / FC_FONT_FILE,
@@ -2127,6 +2131,153 @@ class UdpVideoWindow:
                     return str(mapping.get("bitrate", ""))
         return str(aux_value)
 
+    def fc_get_aux_mode_mapping(self, aux_value: int) -> Tuple[str, Optional[Dict[str, Any]]]:
+        with self.fc_lock:
+            aux_map = list(self.fc_aux_bitrate_map or [])
+
+        for index, mapping in enumerate(aux_map):
+            if not isinstance(mapping, dict):
+                continue
+            if "min" not in mapping or "max" not in mapping:
+                continue
+            min_val = int(mapping.get("min", 0))
+            max_val = int(mapping.get("max", 0))
+            if min_val > max_val:
+                min_val, max_val = max_val, min_val
+            if min_val <= aux_value <= max_val:
+                name = str(mapping.get("name", f"mode-{index + 1}"))
+                return f"{index}:{name}:{min_val}-{max_val}", mapping
+
+        return "__none__", None
+
+    @staticmethod
+    def fc_api_value_to_text(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
+            return "null"
+        if isinstance(value, float):
+            text = f"{value:.6f}".rstrip("0").rstrip(".")
+            return text if text else "0"
+        return str(value)
+
+    def fc_waybeam_base_url(self) -> Optional[str]:
+        host = (self.bridge_remote_host or "").strip()
+        if not host:
+            return None
+
+        parsed = urllib.parse.urlparse(host if "://" in host else f"http://{host}")
+        netloc = parsed.netloc or parsed.path
+        if not netloc:
+            return None
+        return f"http://{netloc}"
+
+    def fc_waybeam_get(self, path: str, timeout: float = 2.5) -> bool:
+        base_url = self.fc_waybeam_base_url()
+        if not base_url:
+            print("[WARN] AUX mode apply skipped: bridge_remote_host is empty", file=sys.stderr)
+            return False
+
+        url = f"{base_url}{path}"
+        context = ssl._create_unverified_context()
+        auth_header = None
+        if self.bridge_http_user or self.bridge_http_password:
+            user = self.bridge_http_user or get_default_majestic_user()
+            password = self.bridge_http_password or get_default_majestic_password()
+            auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+            auth_header = f"Basic {auth}"
+
+        headers = {"Accept": "application/json, text/plain, */*"}
+        if auth_header:
+            headers["Authorization"] = auth_header
+
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+                _ = resp.read(300)
+                return 200 <= int(resp.status) < 300
+        except Exception as e:
+            print(f"[WARN] AUX API GET failed: {url} ({e})", file=sys.stderr)
+
+            # Some firmware builds expose API without auth. Retry once without Authorization.
+            if auth_header:
+                try:
+                    req_no_auth = urllib.request.Request(
+                        url,
+                        method="GET",
+                        headers={"Accept": "application/json, text/plain, */*"},
+                    )
+                    with urllib.request.urlopen(req_no_auth, timeout=timeout, context=context) as resp:
+                        _ = resp.read(300)
+                        return 200 <= int(resp.status) < 300
+                except Exception as e2:
+                    print(f"[WARN] AUX API GET (no auth) failed: {url} ({e2})", file=sys.stderr)
+            return False
+
+    def fc_apply_aux_mode_api(self, mode_key: str, mapping: Dict[str, Any], aux_value: int):
+        bitrate_raw = mapping.get("bitrate", "")
+        api_set = mapping.get("api_set", {})
+
+        payload: Dict[str, Any] = {}
+        if isinstance(api_set, dict):
+            payload.update(api_set)
+
+        bitrate_text = str(bitrate_raw).strip()
+        if bitrate_text and "video0.bitrate" not in payload:
+            try:
+                payload["video0.bitrate"] = int(float(bitrate_text))
+            except Exception:
+                payload["video0.bitrate"] = bitrate_text
+
+        if not payload:
+            return
+
+        restart_sensitive_prefixes = (
+            "video0.fps",
+            "video0.size",
+            "video0.gopSize",
+            "video0.rcMode",
+            "isp.aeFps",
+        )
+        needs_restart = any(str(key).startswith(restart_sensitive_prefixes) for key in payload.keys())
+
+        print(
+            f"[INFO] AUX mode apply: key={mode_key}, aux={aux_value}, fields={len(payload)}",
+            flush=True,
+        )
+
+        for key, value in payload.items():
+            key_text = urllib.parse.quote(str(key), safe="")
+            val_text = urllib.parse.quote(self.fc_api_value_to_text(value), safe="")
+            path = f"/api/v1/set2/{key_text}={val_text}"
+            ok = self.fc_waybeam_get(path, timeout=2.0)
+            if not ok:
+                print(f"[WARN] Failed applying AUX field: {key}={value}", file=sys.stderr)
+
+        if needs_restart:
+            self.fc_waybeam_get("/api/v1/restart", timeout=2.5)
+
+    def fc_handle_aux_mode_switch(self, aux_value: int):
+        mode_key, mapping = self.fc_get_aux_mode_mapping(aux_value)
+        now = time.time()
+
+        with self.fc_aux_apply_lock:
+            if mode_key == self.fc_last_aux_mode_key:
+                return
+            if now - self.fc_last_aux_apply_ts < self.fc_aux_apply_min_interval_sec:
+                return
+            self.fc_last_aux_mode_key = mode_key
+            self.fc_last_aux_apply_ts = now
+
+        if mapping is None:
+            return
+
+        threading.Thread(
+            target=self.fc_apply_aux_mode_api,
+            args=(mode_key, mapping, aux_value),
+            daemon=True,
+        ).start()
+
     def fc_write_osd_bytes(self, row: int, col: int, data_bytes: bytes):
         if row >= FC_OSD_ROWS or col >= FC_OSD_COLS:
             return
@@ -2329,6 +2480,7 @@ class UdpVideoWindow:
                 self.selected_aux_value = aux
                 self.selected_aux_last_time = time.time()
 
+            self.fc_handle_aux_mode_switch(aux)
             self.update_fc_overlay_text()
 
     def parse_fc_msp_stream_bytes(self, data: bytes, parser_state: dict):
@@ -3184,6 +3336,8 @@ StartupWMClass={APP_ID}
                         "bitrate": row["bitrate"].get_text().strip(),
                     }
                 )
+                if isinstance(row.get("api_set"), dict):
+                    aux_map[-1]["api_set"] = dict(row["api_set"])
             self.fc_aux_bitrate_map = aux_map
             if mark_custom and not widgets_sync_in_progress:
                 mark_profile_as_custom()
@@ -3231,6 +3385,7 @@ StartupWMClass={APP_ID}
                 "min": spin_min,
                 "max": spin_max,
                 "bitrate": entry_bitrate,
+                "api_set": mapping.get("api_set") if isinstance(mapping.get("api_set"), dict) else None,
             }
             video_mode_rows.append(row_state)
             aux_bitrate_list_box.pack_start(row_box, False, False, 0)

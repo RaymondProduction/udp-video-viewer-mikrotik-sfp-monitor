@@ -2465,8 +2465,6 @@ class UdpVideoWindow:
             "video0.bitrate",
             "video0.gopSize",
             "video0.gop_size",
-            "video0.zoomX",
-            "video0.zoom_x",
             "video0.qpDelta",
             "video0.qp_delta",
         }
@@ -2668,7 +2666,7 @@ class UdpVideoWindow:
                 mode_name = str(_mode_mapping.get("name", "")).strip()
             else:
                 mode_name = ""
-            display_value = (f"MODE {mode_name}".upper()) if mode_name else str(selected_aux_value)
+            display_value = (f"M:{mode_name}".upper()) if mode_name else str(selected_aux_value)
             aux_text = display_value
             if not self.fc_replace_bitrate_field_with_text(matrix, aux_text):
                 self.fc_put_ascii_text(matrix, self.fc_aux_row, self.fc_aux_col, aux_text)
@@ -3649,6 +3647,15 @@ StartupWMClass={APP_ID}
 
         def update_row_params_label(row_state):
             api_set = row_state.get("api_set") if isinstance(row_state.get("api_set"), dict) else {}
+            live_only_keys = {
+                "video0.fps",
+                "video0.bitrate",
+                "video0.gopSize",
+                "video0.qpDelta",
+                "saturation",
+                "iq.saturation",
+            }
+            api_set = {k: v for k, v in api_set.items() if str(k) in live_only_keys}
             count = len(api_set)
             row_state["params_label"].set_text(f"Параметрів: {count}")
             # Also update gear button tooltip with count
@@ -3658,6 +3665,15 @@ StartupWMClass={APP_ID}
 
         def open_video_mode_params_dialog(row_state):
             existing = row_state.get("api_set") if isinstance(row_state.get("api_set"), dict) else {}
+            live_only_keys = {
+                "video0.fps",
+                "video0.bitrate",
+                "video0.gopSize",
+                "video0.qpDelta",
+                "saturation",
+                "iq.saturation",
+            }
+            existing = {k: v for k, v in existing.items() if str(k) in live_only_keys}
 
             dialog_params = Gtk.Dialog(
                 title="Параметри відеорежиму",
@@ -3692,53 +3708,36 @@ StartupWMClass={APP_ID}
                 grid.attach(widget, 1, row, 1, 1)
                 row += 1
 
-            combo_rc_mode = Gtk.ComboBoxText()
-            for value in ("cbr", "vbr", "fixqp"):
-                combo_rc_mode.append(value, value)
-            combo_rc_mode.set_active_id(str(existing.get("video0.rcMode", "cbr")))
-            add_field("video0.rcMode", combo_rc_mode)
-
             spin_fps = Gtk.SpinButton()
             spin_fps.set_range(1, 120)
             spin_fps.set_increments(1, 5)
             spin_fps.set_value(float(existing.get("video0.fps", 30)))
             add_field("video0.fps", spin_fps)
 
-            size_presets = [
-                "320x180",
-                "640x360",
-                "854x480",
-                "960x540",
-                "1024x576",
-                "1280x720",
-                "1600x900",
-                "1920x1080",
-                "2560x1440",
-            ]
-            combo_size = Gtk.ComboBoxText.new_with_entry()
-            for preset in size_presets:
-                combo_size.append_text(preset)
-            size_text = str(existing.get("video0.size", "1280x720")).strip() or "1280x720"
-            if size_text in size_presets:
-                combo_size.set_active(size_presets.index(size_text))
-            else:
-                size_entry = combo_size.get_child()
-                if isinstance(size_entry, Gtk.Entry):
-                    size_entry.set_text(size_text)
-            add_field("video0.size", combo_size)
-
-            spin_bitrate = Gtk.SpinButton()
-            spin_bitrate.set_range(64, 20000)
-            spin_bitrate.set_increments(64, 256)
+            combo_bitrate = Gtk.ComboBoxText.new_with_entry()
+            bitrate_presets = [str(value) for value in range(512, 16384 + 1, 512)]
+            for preset in bitrate_presets:
+                combo_bitrate.append_text(preset)
             bitrate_text = str(row_state.get("bitrate_value", "")).strip()
-            bitrate_default = 2192
+            bitrate_default = 2048
             if bitrate_text:
                 try:
                     bitrate_default = int(float(bitrate_text))
                 except Exception:
                     pass
-            spin_bitrate.set_value(float(existing.get("video0.bitrate", bitrate_default)))
-            add_field("video0.bitrate", spin_bitrate)
+            try:
+                bitrate_default = int(float(existing.get("video0.bitrate", bitrate_default)))
+            except Exception:
+                pass
+            bitrate_default = max(512, int(round(bitrate_default / 512.0) * 512))
+            bitrate_default_text = str(bitrate_default)
+            if bitrate_default_text in bitrate_presets:
+                combo_bitrate.set_active(bitrate_presets.index(bitrate_default_text))
+            else:
+                bitrate_entry = combo_bitrate.get_child()
+                if isinstance(bitrate_entry, Gtk.Entry):
+                    bitrate_entry.set_text(bitrate_default_text)
+            add_field("video0.bitrate", combo_bitrate)
 
             spin_gop = Gtk.SpinButton()
             spin_gop.set_digits(3)
@@ -3753,42 +3752,6 @@ StartupWMClass={APP_ID}
             spin_qp_delta.set_value(float(existing.get("video0.qpDelta", -4)))
             add_field("video0.qpDelta", spin_qp_delta)
 
-            chk_frame_lost = Gtk.CheckButton(label="Увімкнено")
-            chk_frame_lost.set_active(bool(existing.get("video0.frameLost", True)))
-            add_field("video0.frameLost", chk_frame_lost)
-
-            spin_scene_threshold = Gtk.SpinButton()
-            spin_scene_threshold.set_range(0, 100)
-            spin_scene_threshold.set_increments(1, 5)
-            spin_scene_threshold.set_value(float(existing.get("video0.sceneThreshold", 0)))
-            add_field("video0.sceneThreshold", spin_scene_threshold)
-
-            spin_scene_holdoff = Gtk.SpinButton()
-            spin_scene_holdoff.set_range(0, 20)
-            spin_scene_holdoff.set_increments(1, 2)
-            spin_scene_holdoff.set_value(float(existing.get("video0.sceneHoldoff", 2)))
-            add_field("video0.sceneHoldoff", spin_scene_holdoff)
-
-            combo_resilience = Gtk.ComboBoxText()
-            for value in ("off", "low", "high"):
-                combo_resilience.append(value, value)
-            combo_resilience.set_active_id(str(existing.get("video0.resilience", "off")))
-            add_field("video0.resilience", combo_resilience)
-
-            spin_zoom_x = Gtk.SpinButton()
-            spin_zoom_x.set_digits(3)
-            spin_zoom_x.set_range(0.1, 4.0)
-            spin_zoom_x.set_increments(0.01, 0.1)
-            spin_zoom_x.set_value(float(existing.get("video0.zoomX", 1.0)))
-            add_field("video0.zoomX", spin_zoom_x)
-
-            spin_zoom_y = Gtk.SpinButton()
-            spin_zoom_y.set_digits(3)
-            spin_zoom_y.set_range(0.1, 4.0)
-            spin_zoom_y.set_increments(0.01, 0.1)
-            spin_zoom_y.set_value(float(existing.get("video0.zoomY", 1.0)))
-            add_field("video0.zoomY", spin_zoom_y)
-
             spin_saturation = Gtk.SpinButton()
             spin_saturation.set_range(-100, 100)
             spin_saturation.set_increments(1, 5)
@@ -3796,40 +3759,28 @@ StartupWMClass={APP_ID}
             spin_saturation.set_value(float(sat_default))
             add_field("saturation", spin_saturation)
 
-            combo_framing = Gtk.ComboBoxText()
-            for value in ("off", "on"):
-                combo_framing.append(value, value)
-            combo_framing.set_active_id(str(existing.get("video0.framing", "off")))
-            add_field("video0.framing", combo_framing)
-
             dialog_params.show_all()
             response = dialog_params.run()
             if response == Gtk.ResponseType.OK:
-                selected_size = (combo_size.get_active_text() or "").strip()
-                if not selected_size:
-                    size_entry = combo_size.get_child()
-                    if isinstance(size_entry, Gtk.Entry):
-                        selected_size = size_entry.get_text().strip()
-                if not selected_size:
-                    selected_size = "1280x720"
+                selected_bitrate_text = (combo_bitrate.get_active_text() or "").strip()
+                if not selected_bitrate_text:
+                    bitrate_entry = combo_bitrate.get_child()
+                    if isinstance(bitrate_entry, Gtk.Entry):
+                        selected_bitrate_text = bitrate_entry.get_text().strip()
+                try:
+                    selected_bitrate = int(float(selected_bitrate_text))
+                except Exception:
+                    selected_bitrate = 2048
+                selected_bitrate = max(512, int(round(selected_bitrate / 512.0) * 512))
 
                 row_state["api_set"] = {
-                    "video0.rcMode": combo_rc_mode.get_active_id() or "cbr",
                     "video0.fps": spin_fps.get_value_as_int(),
-                    "video0.size": selected_size,
-                    "video0.bitrate": spin_bitrate.get_value_as_int(),
+                    "video0.bitrate": selected_bitrate,
                     "video0.gopSize": round(spin_gop.get_value(), 3),
                     "video0.qpDelta": spin_qp_delta.get_value_as_int(),
-                    "video0.frameLost": chk_frame_lost.get_active(),
-                    "video0.sceneThreshold": spin_scene_threshold.get_value_as_int(),
-                    "video0.sceneHoldoff": spin_scene_holdoff.get_value_as_int(),
-                    "video0.resilience": combo_resilience.get_active_id() or "off",
-                    "video0.zoomX": round(spin_zoom_x.get_value(), 3),
-                    "video0.zoomY": round(spin_zoom_y.get_value(), 3),
                     "saturation": spin_saturation.get_value_as_int(),
-                    "video0.framing": combo_framing.get_active_id() or "off",
                 }
-                row_state["bitrate_value"] = str(spin_bitrate.get_value_as_int())
+                row_state["bitrate_value"] = str(selected_bitrate)
                 update_row_params_label(row_state)
                 sync_aux_bitrate_map_from_rows(mark_custom=True)
             dialog_params.destroy()
@@ -3854,7 +3805,17 @@ StartupWMClass={APP_ID}
                 if bitrate_value:
                     aux_map[-1]["bitrate"] = bitrate_value
                 if isinstance(row.get("api_set"), dict):
-                    aux_map[-1]["api_set"] = dict(row["api_set"])
+                    live_only_keys = {
+                        "video0.fps",
+                        "video0.bitrate",
+                        "video0.gopSize",
+                        "video0.qpDelta",
+                        "saturation",
+                        "iq.saturation",
+                    }
+                    aux_map[-1]["api_set"] = {
+                        k: v for k, v in row["api_set"].items() if str(k) in live_only_keys
+                    }
             self.fc_aux_bitrate_map = aux_map
             if mark_custom and not widgets_sync_in_progress:
                 mark_profile_as_custom()

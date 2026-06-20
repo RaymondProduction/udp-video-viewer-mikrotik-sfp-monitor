@@ -831,6 +831,10 @@ class UdpVideoWindow:
         self.fc_last_aux_apply_ts = 0.0
         self.fc_aux_apply_min_interval_sec = 0.8
         self.fc_aux_apply_lock = threading.Lock()
+        self.fc_aux_apply_in_progress = False
+        self.fc_aux_pending_request = None
+        self.fc_capabilities_cache = {}
+        self.fc_capabilities_last_ts = 0.0
         fc_font_path = first_existing_path([
             resource_path(FC_FONT_FILE),
             Path(__file__).resolve().parent / FC_FONT_FILE,
@@ -2172,11 +2176,17 @@ class UdpVideoWindow:
             return None
         return f"http://{netloc}"
 
-    def fc_waybeam_get(self, path: str, timeout: float = 2.5) -> bool:
+    def fc_waybeam_get_with_info(
+        self,
+        path: str,
+        timeout: float = 2.5,
+        suppress_errors: bool = False,
+    ) -> Tuple[bool, Optional[int], str]:
         base_url = self.fc_waybeam_base_url()
         if not base_url:
-            print("[WARN] AUX mode apply skipped: bridge_remote_host is empty", file=sys.stderr)
-            return False
+            if not suppress_errors:
+                print("[WARN] AUX mode apply skipped: bridge_remote_host is empty", file=sys.stderr)
+            return False, None, "bridge_remote_host is empty"
 
         url = f"{base_url}{path}"
         context = ssl._create_unverified_context()
@@ -2194,13 +2204,31 @@ class UdpVideoWindow:
         req = urllib.request.Request(url, method="GET", headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
-                _ = resp.read(300)
-                return 200 <= int(resp.status) < 300
+                raw = resp.read(700)
+                body = raw.decode("utf-8", errors="ignore").strip()
+                return 200 <= int(resp.status) < 300, int(resp.status), body
         except Exception as e:
-            print(f"[WARN] AUX API GET failed: {url} ({e})", file=sys.stderr)
+            status = None
+            body = str(e)
+            if isinstance(e, urllib.error.HTTPError):
+                status = e.code
+                try:
+                    raw = e.read(700)
+                    decoded = raw.decode("utf-8", errors="ignore").strip()
+                    if decoded:
+                        body = decoded
+                except Exception:
+                    pass
 
-            # Some firmware builds expose API without auth. Retry once without Authorization.
-            if auth_header:
+            if not suppress_errors:
+                print(f"[WARN] AUX API GET failed: {url} ({e})", file=sys.stderr)
+
+            # Retry without auth only when auth is likely wrong.
+            retry_without_auth = False
+            if auth_header and isinstance(e, urllib.error.HTTPError):
+                retry_without_auth = e.code in (401, 403)
+
+            if retry_without_auth:
                 try:
                     req_no_auth = urllib.request.Request(
                         url,
@@ -2208,15 +2236,168 @@ class UdpVideoWindow:
                         headers={"Accept": "application/json, text/plain, */*"},
                     )
                     with urllib.request.urlopen(req_no_auth, timeout=timeout, context=context) as resp:
-                        _ = resp.read(300)
-                        return 200 <= int(resp.status) < 300
+                        raw = resp.read(700)
+                        body = raw.decode("utf-8", errors="ignore").strip()
+                        return 200 <= int(resp.status) < 300, int(resp.status), body
                 except Exception as e2:
-                    print(f"[WARN] AUX API GET (no auth) failed: {url} ({e2})", file=sys.stderr)
-            return False
+                    status2 = None
+                    body2 = str(e2)
+                    if isinstance(e2, urllib.error.HTTPError):
+                        status2 = e2.code
+                        try:
+                            raw2 = e2.read(700)
+                            decoded2 = raw2.decode("utf-8", errors="ignore").strip()
+                            if decoded2:
+                                body2 = decoded2
+                        except Exception:
+                            pass
+                    if not suppress_errors:
+                        print(f"[WARN] AUX API GET (no auth) failed: {url} ({e2})", file=sys.stderr)
+                    return False, status2, body2
+
+            return False, status, body
+
+    def fc_waybeam_get(self, path: str, timeout: float = 2.5, suppress_errors: bool = False) -> bool:
+        ok, _status, _body = self.fc_waybeam_get_with_info(
+            path,
+            timeout=timeout,
+            suppress_errors=suppress_errors,
+        )
+        return ok
+
+    @staticmethod
+    def fc_to_snake_case_field(field_name: str) -> str:
+        parts = field_name.split(".")
+        if not parts:
+            return field_name
+        leaf = parts[-1]
+        leaf_snake = re.sub(r"(?<!^)([A-Z])", r"_\1", leaf).lower()
+        if leaf_snake == leaf:
+            return field_name
+        parts[-1] = leaf_snake
+        return ".".join(parts)
+
+    def fc_set_config_field(self, key: str, value: Any) -> bool:
+        key_text = urllib.parse.quote(str(key), safe="")
+        val_text = urllib.parse.quote(self.fc_api_value_to_text(value), safe="")
+        path = f"/api/v1/set?{key_text}={val_text}"
+        base_url = self.fc_waybeam_base_url() or ""
+        print(f"[INFO] AUX API SET -> {base_url}{path}", flush=True)
+        ok, status, body = self.fc_waybeam_get_with_info(path, timeout=2.0, suppress_errors=True)
+        if ok:
+            print(f"[INFO] AUX API RESP <- {status}: {body[:220]}", flush=True)
+        else:
+            print(f"[WARN] AUX API RESP <- {status}: {body[:220]}", file=sys.stderr)
+        return ok
+
+    def fc_wait_waybeam_ready(self, timeout_sec: float = 6.0) -> bool:
+        deadline = time.time() + max(0.5, timeout_sec)
+        while time.time() < deadline:
+            if self.fc_waybeam_get("/api/v1/version", timeout=1.0, suppress_errors=True):
+                return True
+            time.sleep(0.35)
+        return False
+
+    def fc_fetch_capabilities(self) -> Dict[str, Any]:
+        # Refresh at most once every 5 seconds to avoid extra API load.
+        now = time.time()
+        if self.fc_capabilities_cache and (now - self.fc_capabilities_last_ts) < 5.0:
+            return self.fc_capabilities_cache
+
+        base_url = self.fc_waybeam_base_url()
+        if not base_url:
+            return self.fc_capabilities_cache
+
+        url = f"{base_url}/api/v1/capabilities"
+        context = ssl._create_unverified_context()
+        auth_header = None
+        if self.bridge_http_user or self.bridge_http_password:
+            user = self.bridge_http_user or get_default_majestic_user()
+            password = self.bridge_http_password or get_default_majestic_password()
+            auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+            auth_header = f"Basic {auth}"
+
+        headers = {"Accept": "application/json, text/plain, */*"}
+        if auth_header:
+            headers["Authorization"] = auth_header
+
+        try:
+            req = urllib.request.Request(url, method="GET", headers=headers)
+            with urllib.request.urlopen(req, timeout=2.0, context=context) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(body) if body else {}
+            fields = data.get("data", {}).get("fields", {}) if isinstance(data, dict) else {}
+            if isinstance(fields, dict):
+                self.fc_capabilities_cache = fields
+                self.fc_capabilities_last_ts = now
+        except Exception:
+            pass
+
+        return self.fc_capabilities_cache
+
+    def fc_get_field_mutability(self, field_name: str) -> str:
+        caps = self.fc_fetch_capabilities()
+        if not isinstance(caps, dict) or not caps:
+            return "unknown"
+
+        candidates = [field_name]
+        alias = self.fc_to_snake_case_field(field_name)
+        if alias not in candidates:
+            candidates.append(alias)
+
+        for candidate in candidates:
+            field_meta = caps.get(candidate)
+            if isinstance(field_meta, dict):
+                mutability = str(field_meta.get("mutability", "unknown"))
+                if mutability:
+                    return mutability
+
+        return "unknown"
+
+    def fc_set_config_field_with_alias(self, key: str, value: Any) -> bool:
+        if self.fc_set_config_field(key, value):
+            return True
+
+        key_alias = self.fc_to_snake_case_field(str(key))
+        if key_alias != str(key):
+            if self.fc_set_config_field(key_alias, value):
+                print(f"[INFO] AUX field alias applied: {key} -> {key_alias}", flush=True)
+                return True
+
+        return False
+
+    def fc_set_config_fields_batch(self, pairs: List[Tuple[str, Any]]) -> bool:
+        if not pairs:
+            return True
+        query = "&".join(
+            f"{urllib.parse.quote(str(key), safe='')}={urllib.parse.quote(self.fc_api_value_to_text(value), safe='')}"
+            for key, value in pairs
+        )
+        path = f"/api/v1/set?{query}"
+        base_url = self.fc_waybeam_base_url() or ""
+        print(f"[INFO] AUX API SET(batch) -> {base_url}{path}", flush=True)
+        ok, status, body = self.fc_waybeam_get_with_info(path, timeout=2.5, suppress_errors=True)
+        if ok:
+            print(f"[INFO] AUX API RESP(batch) <- {status}: {body[:220]}", flush=True)
+        else:
+            print(f"[WARN] AUX API RESP(batch) <- {status}: {body[:220]}", file=sys.stderr)
+        return ok
 
     def fc_apply_aux_mode_api(self, mode_key: str, mapping: Dict[str, Any], aux_value: int):
         bitrate_raw = mapping.get("bitrate", "")
         api_set = mapping.get("api_set", {})
+        apply_restart_fields = bool(mapping.get("apply_restart", False))
+
+        live_whitelist = {
+            "video0.fps",
+            "video0.bitrate",
+            "video0.gopSize",
+            "video0.gop_size",
+            "video0.zoomX",
+            "video0.zoom_x",
+            "video0.qpDelta",
+            "video0.qp_delta",
+        }
 
         payload: Dict[str, Any] = {}
         if isinstance(api_set, dict):
@@ -2229,37 +2410,79 @@ class UdpVideoWindow:
             except Exception:
                 payload["video0.bitrate"] = bitrate_text
 
+        # Temporary safety mode: apply only selected live video0 fields.
+        filtered_payload: Dict[str, Any] = {}
+        dropped_count = 0
+        for key, value in payload.items():
+            key_str = str(key)
+            key_alias = self.fc_to_snake_case_field(key_str)
+            if key_str in live_whitelist or key_alias in live_whitelist:
+                filtered_payload[key_str] = value
+            else:
+                dropped_count += 1
+        payload = filtered_payload
+
         if not payload:
+            if dropped_count > 0:
+                print(f"[INFO] AUX mode {mode_key}: всі {dropped_count} полів поза live whitelist, нічого не застосовано", flush=True)
             return
 
-        restart_sensitive_prefixes = (
-            "video0.fps",
-            "video0.size",
-            "video0.gopSize",
-            "video0.rcMode",
-            "isp.aeFps",
-        )
-        needs_restart = any(str(key).startswith(restart_sensitive_prefixes) for key in payload.keys())
+        if dropped_count > 0:
+            print(f"[INFO] AUX mode {mode_key}: пропущено {dropped_count} полів поза live whitelist", flush=True)
 
         print(
             f"[INFO] AUX mode apply: key={mode_key}, aux={aux_value}, fields={len(payload)}",
             flush=True,
         )
 
+        live_pairs: List[Tuple[str, Any]] = []
+        restart_pairs: List[Tuple[str, Any]] = []
+        unknown_pairs: List[Tuple[str, Any]] = []
         for key, value in payload.items():
-            key_text = urllib.parse.quote(str(key), safe="")
-            val_text = urllib.parse.quote(self.fc_api_value_to_text(value), safe="")
-            path = f"/api/v1/set2/{key_text}={val_text}"
-            ok = self.fc_waybeam_get(path, timeout=2.0)
-            if not ok:
-                print(f"[WARN] Failed applying AUX field: {key}={value}", file=sys.stderr)
+            mutability = self.fc_get_field_mutability(str(key))
+            if mutability == "live":
+                live_pairs.append((str(key), value))
+            elif mutability == "restart_required":
+                restart_pairs.append((str(key), value))
+            else:
+                unknown_pairs.append((str(key), value))
 
-        if needs_restart:
-            self.fc_waybeam_get("/api/v1/restart", timeout=2.5)
+        if live_pairs:
+            if not self.fc_set_config_fields_batch(live_pairs):
+                # Fallback to per-field apply to isolate failures.
+                for key, value in live_pairs:
+                    if not self.fc_set_config_field_with_alias(key, value):
+                        print(f"[WARN] Failed applying AUX field: {key}={value}", file=sys.stderr)
+
+        if restart_pairs and not apply_restart_fields:
+            print(
+                f"[INFO] AUX mode {mode_key}: пропущено {len(restart_pairs)} restart-required полів "
+                f"(додайте apply_restart=true у mapping, якщо треба застосовувати)",
+                flush=True,
+            )
+
+        if apply_restart_fields:
+            for key, value in restart_pairs:
+                if not self.fc_wait_waybeam_ready(timeout_sec=4.0):
+                    print("[WARN] WayBeam API not ready before restart-required set", file=sys.stderr)
+                    break
+                if not self.fc_set_config_field_with_alias(key, value):
+                    print(f"[WARN] Failed applying AUX field: {key}={value}", file=sys.stderr)
+                    continue
+                if not self.fc_wait_waybeam_ready(timeout_sec=7.0):
+                    print("[WARN] WayBeam API did not recover after restart-required set", file=sys.stderr)
+                    break
+
+        for key, value in unknown_pairs:
+            if not self.fc_set_config_field_with_alias(key, value):
+                print(f"[WARN] Failed applying AUX field: {key}={value}", file=sys.stderr)
 
     def fc_handle_aux_mode_switch(self, aux_value: int):
         mode_key, mapping = self.fc_get_aux_mode_mapping(aux_value)
         now = time.time()
+
+        if mapping is None:
+            return
 
         with self.fc_aux_apply_lock:
             if mode_key == self.fc_last_aux_mode_key:
@@ -2268,15 +2491,28 @@ class UdpVideoWindow:
                 return
             self.fc_last_aux_mode_key = mode_key
             self.fc_last_aux_apply_ts = now
+            self.fc_aux_pending_request = (mode_key, mapping, aux_value)
+            if self.fc_aux_apply_in_progress:
+                return
+            self.fc_aux_apply_in_progress = True
 
-        if mapping is None:
-            return
+        def worker_loop():
+            try:
+                while True:
+                    with self.fc_aux_apply_lock:
+                        pending = self.fc_aux_pending_request
+                        self.fc_aux_pending_request = None
 
-        threading.Thread(
-            target=self.fc_apply_aux_mode_api,
-            args=(mode_key, mapping, aux_value),
-            daemon=True,
-        ).start()
+                    if pending is None:
+                        break
+
+                    p_mode_key, p_mapping, p_aux = pending
+                    self.fc_apply_aux_mode_api(p_mode_key, p_mapping, p_aux)
+            finally:
+                with self.fc_aux_apply_lock:
+                    self.fc_aux_apply_in_progress = False
+
+        threading.Thread(target=worker_loop, daemon=True).start()
 
     def fc_write_osd_bytes(self, row: int, col: int, data_bytes: bytes):
         if row >= FC_OSD_ROWS or col >= FC_OSD_COLS:
@@ -3173,8 +3409,8 @@ StartupWMClass={APP_ID}
         spin_fc_aux_col.set_value(self.fc_aux_col)
         self.add_labeled_row(video_modes_aux_grid, 3, "Колонка OSD:", spin_fc_aux_col)
 
-        # Bitrate mapping table
-        aux_bitrate_map_frame, aux_bitrate_map_grid = self.make_section("Таблиця AUX → Бітрейт")
+        # Bitrate/profile mapping table
+        aux_bitrate_map_frame, aux_bitrate_map_grid = self.make_section("Таблиця AUX → Відеорежим")
         aux_bitrate_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
         # Scrollable area for mappings
@@ -3321,6 +3557,154 @@ StartupWMClass={APP_ID}
         widgets_sync_in_progress = False
         video_mode_rows: List[dict] = []
 
+        def update_row_params_label(row_state):
+            api_set = row_state.get("api_set") if isinstance(row_state.get("api_set"), dict) else {}
+            count = len(api_set)
+            row_state["params_label"].set_text(f"Параметрів: {count}")
+
+        def open_video_mode_params_dialog(row_state):
+            existing = row_state.get("api_set") if isinstance(row_state.get("api_set"), dict) else {}
+
+            dialog_params = Gtk.Dialog(
+                title="Параметри відеорежиму",
+                transient_for=dialog,
+                flags=0,
+            )
+            dialog_params.set_default_size(520, 560)
+            dialog_params.add_button("Скасувати", Gtk.ResponseType.CANCEL)
+            dialog_params.add_button("Зберегти", Gtk.ResponseType.OK)
+
+            area = dialog_params.get_content_area()
+            area.set_border_width(10)
+
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_hexpand(True)
+            scrolled.set_vexpand(True)
+            area.pack_start(scrolled, True, True, 0)
+
+            grid = Gtk.Grid()
+            grid.set_row_spacing(8)
+            grid.set_column_spacing(10)
+            scrolled.add(grid)
+
+            row = 0
+
+            def add_field(label_text: str, widget: Gtk.Widget):
+                nonlocal row
+                label = Gtk.Label(label=label_text)
+                label.set_xalign(0.0)
+                widget.set_hexpand(True)
+                grid.attach(label, 0, row, 1, 1)
+                grid.attach(widget, 1, row, 1, 1)
+                row += 1
+
+            combo_rc_mode = Gtk.ComboBoxText()
+            for value in ("cbr", "vbr", "fixqp"):
+                combo_rc_mode.append(value, value)
+            combo_rc_mode.set_active_id(str(existing.get("video0.rcMode", "cbr")))
+            add_field("video0.rcMode", combo_rc_mode)
+
+            spin_fps = Gtk.SpinButton()
+            spin_fps.set_range(1, 120)
+            spin_fps.set_increments(1, 5)
+            spin_fps.set_value(float(existing.get("video0.fps", 30)))
+            add_field("video0.fps", spin_fps)
+
+            entry_size = Gtk.Entry()
+            entry_size.set_text(str(existing.get("video0.size", "1280x720")))
+            add_field("video0.size", entry_size)
+
+            spin_bitrate = Gtk.SpinButton()
+            spin_bitrate.set_range(64, 20000)
+            spin_bitrate.set_increments(64, 256)
+            bitrate_text = row_state["bitrate"].get_text().strip()
+            bitrate_default = 2192
+            if bitrate_text:
+                try:
+                    bitrate_default = int(float(bitrate_text))
+                except Exception:
+                    pass
+            spin_bitrate.set_value(float(existing.get("video0.bitrate", bitrate_default)))
+            add_field("video0.bitrate", spin_bitrate)
+
+            spin_gop = Gtk.SpinButton()
+            spin_gop.set_digits(3)
+            spin_gop.set_range(0.0, 5.0)
+            spin_gop.set_increments(0.001, 0.01)
+            spin_gop.set_value(float(existing.get("video0.gopSize", 0.067)))
+            add_field("video0.gopSize", spin_gop)
+
+            spin_qp_delta = Gtk.SpinButton()
+            spin_qp_delta.set_range(-20, 20)
+            spin_qp_delta.set_increments(1, 2)
+            spin_qp_delta.set_value(float(existing.get("video0.qpDelta", -4)))
+            add_field("video0.qpDelta", spin_qp_delta)
+
+            chk_frame_lost = Gtk.CheckButton(label="Увімкнено")
+            chk_frame_lost.set_active(bool(existing.get("video0.frameLost", True)))
+            add_field("video0.frameLost", chk_frame_lost)
+
+            spin_scene_threshold = Gtk.SpinButton()
+            spin_scene_threshold.set_range(0, 100)
+            spin_scene_threshold.set_increments(1, 5)
+            spin_scene_threshold.set_value(float(existing.get("video0.sceneThreshold", 0)))
+            add_field("video0.sceneThreshold", spin_scene_threshold)
+
+            spin_scene_holdoff = Gtk.SpinButton()
+            spin_scene_holdoff.set_range(0, 20)
+            spin_scene_holdoff.set_increments(1, 2)
+            spin_scene_holdoff.set_value(float(existing.get("video0.sceneHoldoff", 2)))
+            add_field("video0.sceneHoldoff", spin_scene_holdoff)
+
+            combo_resilience = Gtk.ComboBoxText()
+            for value in ("off", "low", "high"):
+                combo_resilience.append(value, value)
+            combo_resilience.set_active_id(str(existing.get("video0.resilience", "off")))
+            add_field("video0.resilience", combo_resilience)
+
+            spin_zoom_x = Gtk.SpinButton()
+            spin_zoom_x.set_digits(3)
+            spin_zoom_x.set_range(0.1, 4.0)
+            spin_zoom_x.set_increments(0.01, 0.1)
+            spin_zoom_x.set_value(float(existing.get("video0.zoomX", 1.0)))
+            add_field("video0.zoomX", spin_zoom_x)
+
+            spin_zoom_y = Gtk.SpinButton()
+            spin_zoom_y.set_digits(3)
+            spin_zoom_y.set_range(0.1, 4.0)
+            spin_zoom_y.set_increments(0.01, 0.1)
+            spin_zoom_y.set_value(float(existing.get("video0.zoomY", 1.0)))
+            add_field("video0.zoomY", spin_zoom_y)
+
+            combo_framing = Gtk.ComboBoxText()
+            for value in ("off", "on"):
+                combo_framing.append(value, value)
+            combo_framing.set_active_id(str(existing.get("video0.framing", "off")))
+            add_field("video0.framing", combo_framing)
+
+            dialog_params.show_all()
+            response = dialog_params.run()
+            if response == Gtk.ResponseType.OK:
+                row_state["api_set"] = {
+                    "video0.rcMode": combo_rc_mode.get_active_id() or "cbr",
+                    "video0.fps": spin_fps.get_value_as_int(),
+                    "video0.size": entry_size.get_text().strip() or "1280x720",
+                    "video0.bitrate": spin_bitrate.get_value_as_int(),
+                    "video0.gopSize": round(spin_gop.get_value(), 3),
+                    "video0.qpDelta": spin_qp_delta.get_value_as_int(),
+                    "video0.frameLost": chk_frame_lost.get_active(),
+                    "video0.sceneThreshold": spin_scene_threshold.get_value_as_int(),
+                    "video0.sceneHoldoff": spin_scene_holdoff.get_value_as_int(),
+                    "video0.resilience": combo_resilience.get_active_id() or "off",
+                    "video0.zoomX": round(spin_zoom_x.get_value(), 3),
+                    "video0.zoomY": round(spin_zoom_y.get_value(), 3),
+                    "video0.framing": combo_framing.get_active_id() or "off",
+                }
+                row_state["bitrate"].set_text(str(spin_bitrate.get_value_as_int()))
+                update_row_params_label(row_state)
+                sync_aux_bitrate_map_from_rows(mark_custom=True)
+            dialog_params.destroy()
+
         def sync_aux_bitrate_map_from_rows(mark_custom=False):
             aux_map = []
             for row in video_mode_rows:
@@ -3367,6 +3751,9 @@ StartupWMClass={APP_ID}
             entry_bitrate.set_text(str(mapping.get("bitrate", "")))
             entry_bitrate.set_width_chars(10)
 
+            button_mode_params = Gtk.Button(label="Параметри...")
+            label_params = Gtk.Label(label="Параметрів: 0")
+            label_params.set_xalign(0.0)
             button_remove_mode = Gtk.Button(label="Видалити")
 
             row_box.pack_start(Gtk.Label(label="Назва:"), False, False, 0)
@@ -3377,6 +3764,8 @@ StartupWMClass={APP_ID}
             row_box.pack_start(spin_max, False, False, 0)
             row_box.pack_start(Gtk.Label(label="Бітрейт:"), False, False, 0)
             row_box.pack_start(entry_bitrate, False, False, 0)
+            row_box.pack_start(label_params, False, False, 0)
+            row_box.pack_start(button_mode_params, False, False, 0)
             row_box.pack_start(button_remove_mode, False, False, 0)
 
             row_state = {
@@ -3386,14 +3775,17 @@ StartupWMClass={APP_ID}
                 "max": spin_max,
                 "bitrate": entry_bitrate,
                 "api_set": mapping.get("api_set") if isinstance(mapping.get("api_set"), dict) else None,
+                "params_label": label_params,
             }
             video_mode_rows.append(row_state)
             aux_bitrate_list_box.pack_start(row_box, False, False, 0)
+            update_row_params_label(row_state)
 
             entry_name.connect("changed", lambda *_: sync_aux_bitrate_map_from_rows(mark_custom=True))
             spin_min.connect("value-changed", lambda *_: sync_aux_bitrate_map_from_rows(mark_custom=True))
             spin_max.connect("value-changed", lambda *_: sync_aux_bitrate_map_from_rows(mark_custom=True))
             entry_bitrate.connect("changed", lambda *_: sync_aux_bitrate_map_from_rows(mark_custom=True))
+            button_mode_params.connect("clicked", lambda *_: open_video_mode_params_dialog(row_state))
 
             def remove_row(_button):
                 if row_state in video_mode_rows:

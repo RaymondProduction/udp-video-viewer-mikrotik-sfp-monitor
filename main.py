@@ -3289,20 +3289,16 @@ StartupWMClass={APP_ID}
         lbl_poll.set_xalign(0.0)
         grid_mt_poll.attach(lbl_poll, 0, 0, 2, 1)
 
-        lbl_version = Gtk.Label(label=f"Версія: {APP_VERSION}")
-        lbl_version.set_xalign(0.0)
-
         left_col.pack_start(info_frame, False, False, 0)
         left_col.pack_start(frame_show, False, False, 0)
         left_col.pack_start(frame_pos, False, False, 0)
         left_col.pack_start(frame_style, False, False, 0)
-        left_col.pack_start(frame_data, False, False, 0)
         left_col.pack_start(Gtk.Box(), True, True, 0)
 
         right_col.pack_start(frame_mt_conn, False, False, 0)
         right_col.pack_start(frame_mt_if, False, False, 0)
         right_col.pack_start(frame_mt_poll, False, False, 0)
-        right_col.pack_start(lbl_version, False, False, 0)
+        right_col.pack_start(frame_data, False, False, 0)
         right_col.pack_start(Gtk.Box(), True, True, 0)
 
         notebook.append_page(mt_osd_page, Gtk.Label(label="MikroTik / SFP"))

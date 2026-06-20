@@ -3592,7 +3592,6 @@ StartupWMClass={APP_ID}
         bridge_page.pack_start(frame_udp, False, False, 0)
         bridge_page.pack_start(frame_http_auth, False, False, 0)
         bridge_page.pack_start(Gtk.Box(), True, True, 0)
-        notebook.append_page(bridge_page, Gtk.Label(label="Міст керування"))
 
         logs_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         logs_page.set_border_width(8)
@@ -3608,7 +3607,6 @@ StartupWMClass={APP_ID}
 
         logs_page.pack_start(frame_logs, False, False, 0)
         logs_page.pack_start(Gtk.Box(), True, True, 0)
-        notebook.append_page(logs_page, Gtk.Label(label="Логи"))
 
         video_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         video_page.set_border_width(8)
@@ -3642,7 +3640,9 @@ StartupWMClass={APP_ID}
         video_page.pack_start(frame_window_behavior, False, False, 0)
         video_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(video_page, Gtk.Label(label="Відеопотік"))
+        notebook.append_page(bridge_page, Gtk.Label(label="Міст керування"))
         notebook.append_page(mt_osd_page, Gtk.Label(label="MikroTik / SFP"))
+        notebook.append_page(logs_page, Gtk.Label(label="Логи"))
 
         widgets_sync_in_progress = False
         video_mode_rows: List[dict] = []
@@ -3704,9 +3704,28 @@ StartupWMClass={APP_ID}
             spin_fps.set_value(float(existing.get("video0.fps", 30)))
             add_field("video0.fps", spin_fps)
 
-            entry_size = Gtk.Entry()
-            entry_size.set_text(str(existing.get("video0.size", "1280x720")))
-            add_field("video0.size", entry_size)
+            size_presets = [
+                "320x180",
+                "640x360",
+                "854x480",
+                "960x540",
+                "1024x576",
+                "1280x720",
+                "1600x900",
+                "1920x1080",
+                "2560x1440",
+            ]
+            combo_size = Gtk.ComboBoxText.new_with_entry()
+            for preset in size_presets:
+                combo_size.append_text(preset)
+            size_text = str(existing.get("video0.size", "1280x720")).strip() or "1280x720"
+            if size_text in size_presets:
+                combo_size.set_active(size_presets.index(size_text))
+            else:
+                size_entry = combo_size.get_child()
+                if isinstance(size_entry, Gtk.Entry):
+                    size_entry.set_text(size_text)
+            add_field("video0.size", combo_size)
 
             spin_bitrate = Gtk.SpinButton()
             spin_bitrate.set_range(64, 20000)
@@ -3786,10 +3805,18 @@ StartupWMClass={APP_ID}
             dialog_params.show_all()
             response = dialog_params.run()
             if response == Gtk.ResponseType.OK:
+                selected_size = (combo_size.get_active_text() or "").strip()
+                if not selected_size:
+                    size_entry = combo_size.get_child()
+                    if isinstance(size_entry, Gtk.Entry):
+                        selected_size = size_entry.get_text().strip()
+                if not selected_size:
+                    selected_size = "1280x720"
+
                 row_state["api_set"] = {
                     "video0.rcMode": combo_rc_mode.get_active_id() or "cbr",
                     "video0.fps": spin_fps.get_value_as_int(),
-                    "video0.size": entry_size.get_text().strip() or "1280x720",
+                    "video0.size": selected_size,
                     "video0.bitrate": spin_bitrate.get_value_as_int(),
                     "video0.gopSize": round(spin_gop.get_value(), 3),
                     "video0.qpDelta": spin_qp_delta.get_value_as_int(),

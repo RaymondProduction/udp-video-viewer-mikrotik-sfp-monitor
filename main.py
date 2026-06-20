@@ -1120,6 +1120,7 @@ class UdpVideoWindow:
                 "port": 5600,
                 "mode": "rtp",
                 "always_on_top": True,
+                "modes": [],
             },
             "mikrotik": {
                 "host": "192.168.121.1",
@@ -1138,7 +1139,6 @@ class UdpVideoWindow:
                 "aux_channel": -1,
                 "aux_row": 0,
                 "aux_col": 0,
-                "aux_bitrate_map": [],
             },
         }
 
@@ -1173,6 +1173,7 @@ class UdpVideoWindow:
                 "port": 5600,
                 "mode": "rtp",
                 "always_on_top": True,
+                "modes": [],
             },
             "mikrotik": {
                 "host": "192.168.1.1",
@@ -1191,7 +1192,6 @@ class UdpVideoWindow:
                 "aux_channel": -1,
                 "aux_row": 0,
                 "aux_col": 0,
-                "aux_bitrate_map": [],
             },
         }
 
@@ -1210,6 +1210,10 @@ class UdpVideoWindow:
         video = data.get("video", {}) if isinstance(data, dict) else {}
         mikrotik = data.get("mikrotik", {}) if isinstance(data, dict) else {}
         fc_telemetry = data.get("fc_telemetry", {}) if isinstance(data, dict) else {}
+        modes_source = video.get("modes")
+        if not isinstance(modes_source, list):
+            # Backward compatibility with old profile schema.
+            modes_source = fc_telemetry.get("aux_bitrate_map", [])
 
         halign = str(osd.get("halign", defaults["osd"]["halign"])).lower()
         if halign not in ("left", "right"):
@@ -1261,6 +1265,21 @@ class UdpVideoWindow:
                 "port": int(video.get("port", defaults["video"]["port"])),
                 "mode": mode,
                 "always_on_top": bool(video.get("always_on_top", defaults["video"]["always_on_top"])),
+                "modes": [
+                    {
+                        **m,
+                        "bitrate": str(
+                            m.get("bitrate", "")
+                            or (
+                                m.get("api_set", {}).get("video0.bitrate", "")
+                                if isinstance(m.get("api_set"), dict)
+                                else ""
+                            )
+                        ),
+                    }
+                    for m in modes_source
+                    if isinstance(m, dict) and "min" in m and "max" in m
+                ],
             },
             "mikrotik": {
                 "host": str(mikrotik.get("host", defaults["mikrotik"]["host"])),
@@ -1279,21 +1298,6 @@ class UdpVideoWindow:
                 "aux_channel": int(fc_telemetry.get("aux_channel", defaults["fc_telemetry"].get("aux_channel", -1))),
                 "aux_row": int(fc_telemetry.get("aux_row", defaults["fc_telemetry"].get("aux_row", 0))),
                 "aux_col": int(fc_telemetry.get("aux_col", defaults["fc_telemetry"].get("aux_col", 0))),
-                "aux_bitrate_map": [
-                    {
-                        **m,
-                        "bitrate": str(
-                            m.get("bitrate", "")
-                            or (
-                                m.get("api_set", {}).get("video0.bitrate", "")
-                                if isinstance(m.get("api_set"), dict)
-                                else ""
-                            )
-                        ),
-                    }
-                    for m in fc_telemetry.get("aux_bitrate_map", [])
-                    if isinstance(m, dict) and "min" in m and "max" in m
-                ],
             },
         }
 
@@ -1329,6 +1333,7 @@ class UdpVideoWindow:
                     "port": self.port,
                     "mode": self.mode,
                     "always_on_top": self.always_on_top,
+                    "modes": self.fc_aux_bitrate_map,
                 },
                 "mikrotik": {
                     "host": self.mikrotik_host,
@@ -1347,7 +1352,6 @@ class UdpVideoWindow:
                     "aux_channel": self.fc_aux_channel_index,
                     "aux_row": self.fc_aux_row,
                     "aux_col": self.fc_aux_col,
-                    "aux_bitrate_map": self.fc_aux_bitrate_map,
                 },
             }
         )
@@ -1396,7 +1400,7 @@ class UdpVideoWindow:
         self.fc_show_aux_osd = bool(fc_telemetry.get("show_aux", True)) and self.fc_aux_channel_index >= 0
         self.fc_aux_row = max(0, min(FC_OSD_ROWS - 1, int(fc_telemetry.get("aux_row", 0))))
         self.fc_aux_col = max(0, min(FC_OSD_COLS - 1, int(fc_telemetry.get("aux_col", 0))))
-        self.fc_aux_bitrate_map = fc_telemetry.get("aux_bitrate_map", [])
+        self.fc_aux_bitrate_map = video.get("modes", fc_telemetry.get("aux_bitrate_map", []))
 
         bridge = profile.get("bridge", {})
         self.serial_dev = bridge.get("serial_dev") or None
@@ -2308,6 +2312,19 @@ class UdpVideoWindow:
             print(f"[WARN] AUX API RESP <- {status}: {body[:220]}", file=sys.stderr)
         return ok
 
+    def fc_set_iq_field(self, key: str, value: Any) -> bool:
+        key_text = urllib.parse.quote(str(key), safe="")
+        val_text = urllib.parse.quote(self.fc_api_value_to_text(value), safe="")
+        path = f"/api/v1/iq/set?{key_text}={val_text}"
+        base_url = self.fc_waybeam_base_url() or ""
+        print(f"[INFO] AUX API IQ SET -> {base_url}{path}", flush=True)
+        ok, status, body = self.fc_waybeam_get_with_info(path, timeout=2.0, suppress_errors=True)
+        if ok:
+            print(f"[INFO] AUX API IQ RESP <- {status}: {body[:220]}", flush=True)
+        else:
+            print(f"[WARN] AUX API IQ RESP <- {status}: {body[:220]}", file=sys.stderr)
+        return ok
+
     def fc_wait_waybeam_ready(self, timeout_sec: float = 6.0) -> bool:
         deadline = time.time() + max(0.5, timeout_sec)
         while time.time() < deadline:
@@ -2421,6 +2438,13 @@ class UdpVideoWindow:
         if isinstance(api_set, dict):
             payload.update(api_set)
 
+        # IQ fields are applied via /api/v1/iq/set, not /api/v1/set.
+        iq_payload: Dict[str, Any] = {}
+        if "saturation" in payload:
+            iq_payload["saturation"] = payload.pop("saturation")
+        if "iq.saturation" in payload:
+            iq_payload["saturation"] = payload.pop("iq.saturation")
+
         bitrate_text = str(bitrate_raw).strip()
         if bitrate_text and "video0.bitrate" not in payload:
             try:
@@ -2440,7 +2464,7 @@ class UdpVideoWindow:
                 dropped_count += 1
         payload = filtered_payload
 
-        if not payload:
+        if not payload and not iq_payload:
             if dropped_count > 0:
                 print(f"[INFO] AUX mode {mode_key}: всі {dropped_count} полів поза live whitelist, нічого не застосовано", flush=True)
             return
@@ -2449,7 +2473,7 @@ class UdpVideoWindow:
             print(f"[INFO] AUX mode {mode_key}: пропущено {dropped_count} полів поза live whitelist", flush=True)
 
         print(
-            f"[INFO] AUX mode apply: key={mode_key}, aux={aux_value}, fields={len(payload)}",
+            f"[INFO] AUX mode apply: key={mode_key}, aux={aux_value}, fields={len(payload) + len(iq_payload)}",
             flush=True,
         )
 
@@ -2494,6 +2518,10 @@ class UdpVideoWindow:
         for key, value in unknown_pairs:
             if not self.fc_set_config_field_with_alias(key, value):
                 print(f"[WARN] Failed applying AUX field: {key}={value}", file=sys.stderr)
+
+        for iq_key, iq_value in iq_payload.items():
+            if not self.fc_set_iq_field(iq_key, iq_value):
+                print(f"[WARN] Failed applying AUX IQ field: {iq_key}={iq_value}", file=sys.stderr)
 
     def fc_handle_aux_mode_switch(self, aux_value: int):
         mode_key, mapping = self.fc_get_aux_mode_mapping(aux_value)
@@ -3697,6 +3725,13 @@ StartupWMClass={APP_ID}
             spin_zoom_y.set_value(float(existing.get("video0.zoomY", 1.0)))
             add_field("video0.zoomY", spin_zoom_y)
 
+            spin_saturation = Gtk.SpinButton()
+            spin_saturation.set_range(-100, 100)
+            spin_saturation.set_increments(1, 5)
+            sat_default = existing.get("saturation", existing.get("iq.saturation", 0))
+            spin_saturation.set_value(float(sat_default))
+            add_field("saturation", spin_saturation)
+
             combo_framing = Gtk.ComboBoxText()
             for value in ("off", "on"):
                 combo_framing.append(value, value)
@@ -3719,6 +3754,7 @@ StartupWMClass={APP_ID}
                     "video0.resilience": combo_resilience.get_active_id() or "off",
                     "video0.zoomX": round(spin_zoom_x.get_value(), 3),
                     "video0.zoomY": round(spin_zoom_y.get_value(), 3),
+                    "saturation": spin_saturation.get_value_as_int(),
                     "video0.framing": combo_framing.get_active_id() or "off",
                 }
                 row_state["bitrate_value"] = str(spin_bitrate.get_value_as_int())
@@ -3956,7 +3992,7 @@ StartupWMClass={APP_ID}
                 combo_video_aux_channel.set_active_id(str(fc_telemetry.get("aux_channel", -1)))
                 spin_fc_aux_row.set_value(fc_telemetry.get("aux_row", 0))
                 spin_fc_aux_col.set_value(fc_telemetry.get("aux_col", 0))
-                load_video_mode_rows(fc_telemetry.get("aux_bitrate_map", []))
+                load_video_mode_rows(video.get("modes", fc_telemetry.get("aux_bitrate_map", [])))
 
                 update_osd_widgets_state()
                 update_fc_widgets_state()
@@ -3998,6 +4034,7 @@ StartupWMClass={APP_ID}
                         "port": spin_video_port.get_value_as_int(),
                         "mode": combo_video_mode.get_active_id() or "rtp",
                         "always_on_top": chk_always_on_top.get_active(),
+                        "modes": self.fc_aux_bitrate_map,
                     },
                     "mikrotik": {
                         "host": entry_mt_host.get_text().strip(),
@@ -4016,7 +4053,6 @@ StartupWMClass={APP_ID}
                         "aux_channel": int(combo_video_aux_channel.get_active_id() or "-1"),
                         "aux_row": spin_fc_aux_row.get_value_as_int(),
                         "aux_col": spin_fc_aux_col.get_value_as_int(),
-                        "aux_bitrate_map": self.fc_aux_bitrate_map,
                     },
                 }
             )

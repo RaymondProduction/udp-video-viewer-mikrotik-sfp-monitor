@@ -2603,7 +2603,7 @@ class UdpVideoWindow:
                 mode_name = str(_mode_mapping.get("name", "")).strip()
             else:
                 mode_name = ""
-            display_value = mode_name if mode_name else str(selected_aux_value)
+            display_value = (f"MODE {mode_name}".upper()) if mode_name else str(selected_aux_value)
             aux_text = display_value
             if not self.fc_replace_bitrate_field_with_text(matrix, aux_text):
                 self.fc_put_ascii_text(matrix, self.fc_aux_row, self.fc_aux_col, aux_text)

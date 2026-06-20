@@ -119,6 +119,18 @@ CRSF_FRAME_TYPE_RC_CHANNELS_PACKED = 0x16
 CRSF_MAX_FRAME_LEN = 64
 RC_AUX_NONE_INDEX = -1  # -1 = не вибрано; AUX1=CH5=index 4, AUX2=CH6=index 5, ...
 
+VIDEO_DECODER_CHOICES: List[Tuple[str, str]] = [
+    ("avdec_h265", "avdec_h265 - CPU (gst-libav, Linux/macOS/Windows, x86_64/arm64)"),
+    ("decodebin", "decodebin - авто вибір декодера під ОС/архітектуру"),
+    ("d3d11h265dec", "d3d11h265dec - Windows GPU (Direct3D11)"),
+    ("vtdec", "vtdec - macOS GPU (VideoToolbox)"),
+    ("vaapih265dec", "vaapih265dec - Linux GPU (VAAPI, Intel/AMD)"),
+    ("nvh265dec", "nvh265dec - NVIDIA GPU (Linux/Windows)"),
+    ("v4l2h265dec", "v4l2h265dec - Linux ARM/SBC (V4L2 M2M)"),
+]
+VIDEO_DECODER_IDS = {decoder_id for decoder_id, _ in VIDEO_DECODER_CHOICES}
+DEFAULT_VIDEO_DECODER = "avdec_h265"
+
 
 
 def get_local_ipv4_networks() -> List[ipaddress.IPv4Network]:
@@ -1119,6 +1131,7 @@ class UdpVideoWindow:
             "video": {
                 "port": 5600,
                 "mode": "rtp",
+                "decoder": DEFAULT_VIDEO_DECODER,
                 "always_on_top": True,
                 "modes": [],
             },
@@ -1172,6 +1185,7 @@ class UdpVideoWindow:
             "video": {
                 "port": 5600,
                 "mode": "rtp",
+                "decoder": DEFAULT_VIDEO_DECODER,
                 "always_on_top": True,
                 "modes": [],
             },
@@ -1227,6 +1241,10 @@ class UdpVideoWindow:
         if mode not in ("raw", "rtp"):
             mode = defaults["video"]["mode"]
 
+        decoder = str(video.get("decoder", defaults["video"].get("decoder", DEFAULT_VIDEO_DECODER))).strip().lower()
+        if decoder not in VIDEO_DECODER_IDS:
+            decoder = defaults["video"].get("decoder", DEFAULT_VIDEO_DECODER)
+
         http_user = str(bridge.get("http_user", defaults["bridge"]["http_user"]))
         http_password = str(bridge.get("http_password", defaults["bridge"]["http_password"]))
 
@@ -1264,6 +1282,7 @@ class UdpVideoWindow:
             "video": {
                 "port": int(video.get("port", defaults["video"]["port"])),
                 "mode": mode,
+                "decoder": decoder,
                 "always_on_top": bool(video.get("always_on_top", defaults["video"]["always_on_top"])),
                 "modes": [
                     {
@@ -1332,6 +1351,7 @@ class UdpVideoWindow:
                 "video": {
                     "port": self.port,
                     "mode": self.mode,
+                    "decoder": self.video_decoder,
                     "always_on_top": self.always_on_top,
                     "modes": self.fc_aux_bitrate_map,
                 },
@@ -1381,6 +1401,7 @@ class UdpVideoWindow:
         video = profile.get("video", {})
         self.port = int(video.get("port", 5600))
         self.mode = str(video.get("mode", "rtp"))
+        self.video_decoder = str(video.get("decoder", DEFAULT_VIDEO_DECODER))
         self.always_on_top = bool(video.get("always_on_top", True))
 
         mikrotik = profile.get("mikrotik", {})
@@ -1486,6 +1507,21 @@ class UdpVideoWindow:
             return ""
         return "STATUS: Підключення до MikroTik..."
 
+    def resolve_h265_decoder(self, decoder_id: str) -> str:
+        normalized = str(decoder_id or DEFAULT_VIDEO_DECODER).strip().lower()
+        if normalized not in VIDEO_DECODER_IDS:
+            normalized = DEFAULT_VIDEO_DECODER
+
+        if normalized != "decodebin" and Gst.ElementFactory.find(normalized) is None:
+            print(
+                f"[WARN] Декодер '{normalized}' не знайдено в GStreamer, fallback на decodebin",
+                file=sys.stderr,
+                flush=True,
+            )
+            return "decodebin"
+
+        return normalized
+
     def build_pipeline(self, port: int, mode: str, text: str) -> str:
         safe_text = self.escape_gst_text(text)
         bg_value = "true" if self.overlay_background else "false"
@@ -1523,13 +1559,14 @@ class UdpVideoWindow:
             """
 
         if mode == "rtp":
+            h265_decoder = self.resolve_h265_decoder(self.video_decoder)
             return f"""
                 udpsrc port={port}
                     caps="application/x-rtp,media=video,encoding-name=H265"
                 ! rtpjitterbuffer latency=0
                 ! rtph265depay
                 ! h265parse
-                ! avdec_h265
+                ! {h265_decoder}
                 ! videoconvert
                 {overlay_block}
                 ! cairooverlay name=fc_canvas
@@ -3588,6 +3625,14 @@ StartupWMClass={APP_ID}
         combo_video_mode.set_active_id(self.mode)
         self.add_labeled_row(grid_video_main, 1, "Режим:", combo_video_mode)
 
+        combo_video_decoder = Gtk.ComboBoxText()
+        for decoder_id, decoder_title in VIDEO_DECODER_CHOICES:
+            combo_video_decoder.append(decoder_id, decoder_title)
+        combo_video_decoder.set_active_id(
+            self.video_decoder if self.video_decoder in VIDEO_DECODER_IDS else DEFAULT_VIDEO_DECODER
+        )
+        self.add_labeled_row(grid_video_main, 2, "Декодер H265 (RTP):", combo_video_decoder)
+
         frame_window_behavior, grid_window_behavior = self.make_section("Поведінка вікна")
         chk_always_on_top = Gtk.CheckButton(label="Поверх інших вікон")
         chk_always_on_top.set_active(self.always_on_top)
@@ -3976,6 +4021,7 @@ StartupWMClass={APP_ID}
 
                 spin_video_port.set_value(video["port"])
                 combo_video_mode.set_active_id(video["mode"])
+                combo_video_decoder.set_active_id(video["decoder"])
                 chk_always_on_top.set_active(video["always_on_top"])
 
                 entry_mt_host.set_text(mikrotik["host"])
@@ -4033,6 +4079,7 @@ StartupWMClass={APP_ID}
                     "video": {
                         "port": spin_video_port.get_value_as_int(),
                         "mode": combo_video_mode.get_active_id() or "rtp",
+                        "decoder": combo_video_decoder.get_active_id() or DEFAULT_VIDEO_DECODER,
                         "always_on_top": chk_always_on_top.get_active(),
                         "modes": self.fc_aux_bitrate_map,
                     },
@@ -4058,7 +4105,7 @@ StartupWMClass={APP_ID}
             )
 
         def apply_runtime_profile(profile_data, selected_profile_id, save_after=False):
-            prev_video_pipeline_state = (self.port, self.mode)
+            prev_video_pipeline_state = (self.port, self.mode, self.video_decoder)
             prev_enable_telemetry_osd = self.enable_telemetry_osd
             prev_bridge_state = (
                 self.serial_dev,
@@ -4097,7 +4144,7 @@ StartupWMClass={APP_ID}
             self.auto_controller_enabled = not bool(self.serial_dev)
             self.window.set_keep_above(self.always_on_top)
 
-            video_pipeline_state = (self.port, self.mode)
+            video_pipeline_state = (self.port, self.mode, self.video_decoder)
             video_pipeline_changed = video_pipeline_state != prev_video_pipeline_state
 
             bridge_state = (
@@ -4224,6 +4271,7 @@ StartupWMClass={APP_ID}
             chk_bridge_hex,
             spin_video_port,
             combo_video_mode,
+            combo_video_decoder,
             chk_always_on_top,
             entry_mt_host,
             entry_mt_user,

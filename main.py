@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 import ssl
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Callable
 
 import gi
 import paramiko
@@ -113,6 +113,11 @@ FC_FONT_CHAR_WIDTH = 24
 FC_FONT_CHAR_HEIGHT = 36
 FC_FONT_FILE = "font_btfl_hd.png"
 FC_OSD_SCALE = 0.85
+
+# CRSF RC channel parsing from controller bridge.
+CRSF_FRAME_TYPE_RC_CHANNELS_PACKED = 0x16
+CRSF_MAX_FRAME_LEN = 64
+RC_AUX_NONE_INDEX = -1  # -1 = не вибрано; AUX1=CH5=index 4, AUX2=CH6=index 5, ...
 
 
 
@@ -487,6 +492,7 @@ class UdpSerialBridge:
         udp_timeout: float = 0.2,
         verbose: bool = False,
         hex_dump: bool = False,
+        serial_rx_callback: Optional[Callable[[bytes], None]] = None,
     ):
         self.remote_host = remote_host
         self.remote_port = remote_port
@@ -498,6 +504,7 @@ class UdpSerialBridge:
         self.udp_timeout = udp_timeout
         self.verbose = verbose
         self.hex_dump = hex_dump
+        self.serial_rx_callback = serial_rx_callback
 
         self.running = False
         self.failed = False
@@ -684,6 +691,12 @@ class UdpSerialBridge:
                 if not data:
                     continue
 
+                if self.serial_rx_callback is not None:
+                    try:
+                        self.serial_rx_callback(data)
+                    except Exception as e:
+                        self.log(f"serial_rx_callback error: {e}")
+
                 self.sock.send(data)
                 self.packets_serial_to_udp += 1
                 self.bytes_serial_to_udp += len(data)
@@ -809,6 +822,9 @@ class UdpVideoWindow:
         self.fc_status_text = "FC telemetry: вимкнено"
         self.fc_last_packet_time = 0.0
         self.fc_reconnect_requested = False
+        self.crsf_parser_buffer = bytearray()
+        self.selected_aux_value = None
+        self.selected_aux_last_time = 0.0
         self.fc_canvas = None
         self.fc_font_surface = None
         fc_font_path = first_existing_path([
@@ -1110,6 +1126,10 @@ class UdpVideoWindow:
                 "port": 9001,
                 "heartbeat_interval": 0.4,
                 "stale_timeout": 2.0,
+                "show_aux": True,
+                "aux_channel": -1,
+                "aux_row": 0,
+                "aux_col": 0,
             },
         }
 
@@ -1158,6 +1178,10 @@ class UdpVideoWindow:
                 "port": 9001,
                 "heartbeat_interval": 0.4,
                 "stale_timeout": 2.0,
+                "show_aux": True,
+                "aux_channel": -1,
+                "aux_row": 0,
+                "aux_col": 0,
             },
         }
 
@@ -1241,6 +1265,10 @@ class UdpVideoWindow:
                 "port": int(fc_telemetry.get("port", defaults["fc_telemetry"]["port"])),
                 "heartbeat_interval": float(fc_telemetry.get("heartbeat_interval", defaults["fc_telemetry"]["heartbeat_interval"])),
                 "stale_timeout": float(fc_telemetry.get("stale_timeout", defaults["fc_telemetry"]["stale_timeout"])),
+                "show_aux": bool(fc_telemetry.get("show_aux", defaults["fc_telemetry"].get("show_aux", True))),
+                "aux_channel": int(fc_telemetry.get("aux_channel", defaults["fc_telemetry"].get("aux_channel", -1))),
+                "aux_row": int(fc_telemetry.get("aux_row", defaults["fc_telemetry"].get("aux_row", 0))),
+                "aux_col": int(fc_telemetry.get("aux_col", defaults["fc_telemetry"].get("aux_col", 0))),
             },
         }
 
@@ -1290,6 +1318,10 @@ class UdpVideoWindow:
                     "port": self.fc_telemetry_port,
                     "heartbeat_interval": self.fc_telemetry_heartbeat_interval,
                     "stale_timeout": self.fc_telemetry_stale_timeout,
+                    "show_aux": self.fc_show_aux_osd,
+                    "aux_channel": self.fc_aux_channel_index,
+                    "aux_row": self.fc_aux_row,
+                    "aux_col": self.fc_aux_col,
                 },
             }
         )
@@ -1334,6 +1366,10 @@ class UdpVideoWindow:
         self.fc_telemetry_port = int(fc_telemetry.get("port", 9001))
         self.fc_telemetry_heartbeat_interval = max(0.1, float(fc_telemetry.get("heartbeat_interval", 0.4)))
         self.fc_telemetry_stale_timeout = max(0.5, float(fc_telemetry.get("stale_timeout", 2.0)))
+        self.fc_aux_channel_index = max(-1, min(15, int(fc_telemetry.get("aux_channel", -1))))
+        self.fc_show_aux_osd = bool(fc_telemetry.get("show_aux", True)) and self.fc_aux_channel_index >= 0
+        self.fc_aux_row = max(0, min(FC_OSD_ROWS - 1, int(fc_telemetry.get("aux_row", 0))))
+        self.fc_aux_col = max(0, min(FC_OSD_COLS - 1, int(fc_telemetry.get("aux_col", 0))))
 
         bridge = profile.get("bridge", {})
         self.serial_dev = bridge.get("serial_dev") or None
@@ -2131,6 +2167,19 @@ class UdpVideoWindow:
 
         with self.fc_lock:
             matrix = list(self.fc_matrix)
+            selected_aux_value = self.selected_aux_value
+            aux_age = time.time() - self.selected_aux_last_time if self.selected_aux_last_time else 999.0
+
+        if self.fc_show_aux_osd and selected_aux_value is not None and aux_age < 2.0:
+            # Do not draw AUX as an extra independent OSD block.
+            # It can shift attention and visually fight with Betaflight OSD.
+            # Instead we replace the existing Betaflight field "video transmitter bitrate"
+            # (usually rendered as something like 50MBPS / 5.0MBPS). If the field is
+            # not present in the current BF OSD profile, we fall back to the configured
+            # row/column from the Video Modes settings.
+            aux_text = f"AUX{self.fc_aux_channel_index - 3}:{selected_aux_value}"
+            if not self.fc_replace_bitrate_field_with_text(matrix, aux_text):
+                self.fc_put_ascii_text(matrix, self.fc_aux_row, self.fc_aux_col, aux_text)
 
         scale_x = width * FC_OSD_SCALE / (FC_OSD_COLS * FC_FONT_CHAR_WIDTH)
         scale_y = height * FC_OSD_SCALE / (FC_OSD_ROWS * FC_FONT_CHAR_HEIGHT)
@@ -2158,6 +2207,112 @@ class UdpVideoWindow:
                 context.fill()
 
         context.restore()
+
+    def fc_put_ascii_text(self, matrix: List[int], row: int, col: int, text: str):
+        if row < 0 or row >= FC_OSD_ROWS or col < 0 or col >= FC_OSD_COLS:
+            return
+        idx = row * FC_OSD_COLS + col
+        for i, ch in enumerate(text):
+            if col + i >= FC_OSD_COLS:
+                break
+            code = ord(ch)
+            matrix[idx + i] = code if 0 <= code <= 255 else 32
+
+    def fc_row_text(self, matrix: List[int], row: int) -> str:
+        start = row * FC_OSD_COLS
+        return "".join(decode_fc_osd_byte(x) for x in matrix[start:start + FC_OSD_COLS])
+
+    def fc_clear_range(self, matrix: List[int], row: int, col: int, length: int):
+        if row < 0 or row >= FC_OSD_ROWS or col < 0 or col >= FC_OSD_COLS:
+            return
+        start = row * FC_OSD_COLS + col
+        for i in range(max(0, length)):
+            if col + i >= FC_OSD_COLS:
+                break
+            matrix[start + i] = 32
+
+    def fc_replace_bitrate_field_with_text(self, matrix: List[int], text: str) -> bool:
+        # Betaflight names this OSD item "Video transmitter bitrate". In the MSP
+        # DisplayPort stream it is already a prepared text cell, commonly containing
+        # "MBPS" (for example "50MBPS" / "5.0MBPS"). We search the rendered 50x18
+        # character grid and replace only that existing field, so the rest of FC OSD
+        # stays untouched.
+        for row in range(FC_OSD_ROWS):
+            line = self.fc_row_text(matrix, row)
+            upper = line.upper()
+            pos = upper.find("MBPS")
+            if pos < 0:
+                continue
+
+            start = pos
+            while start > 0 and line[start - 1] not in " 	":
+                start -= 1
+
+            end = pos + 4
+            while end < len(line) and line[end] not in " 	":
+                end += 1
+
+            width = max(end - start, len(text))
+            self.fc_clear_range(matrix, row, start, width)
+            self.fc_put_ascii_text(matrix, row, start, text[:width])
+            return True
+
+        return False
+
+    @staticmethod
+    def decode_crsf_rc_channels(payload: bytes) -> Optional[List[int]]:
+        if len(payload) < 22:
+            return None
+        bitbuf = int.from_bytes(payload[:22], byteorder="little", signed=False)
+        return [(bitbuf >> (11 * i)) & 0x7FF for i in range(16)]
+
+    def handle_crsf_serial_bytes(self, data: bytes):
+        # Called from the serial->UDP bridge before data is forwarded to the camera.
+        # We passively sniff CRSF RC_CHANNELS_PACKED and extract the AUX selected in video modes settings.
+        if not data or self.fc_aux_channel_index < 0:
+            return
+        buf = self.crsf_parser_buffer
+        buf.extend(data)
+
+        # Prevent unbounded growth if random bytes arrive.
+        if len(buf) > 512:
+            del buf[:-128]
+
+        crsf_sync_bytes = {0x00, 0xC2, 0xC8, 0xEA, 0xEC, 0xEE}
+
+        while len(buf) >= 2:
+            if buf[0] not in crsf_sync_bytes:
+                del buf[0]
+                continue
+
+            frame_len = buf[1]
+            if frame_len < 2 or frame_len > CRSF_MAX_FRAME_LEN:
+                del buf[0]
+                continue
+
+            total_len = frame_len + 2
+            if len(buf) < total_len:
+                break
+
+            frame = bytes(buf[:total_len])
+            del buf[:total_len]
+
+            frame_type = frame[2]
+            payload = frame[3:-1]
+            if frame_type != CRSF_FRAME_TYPE_RC_CHANNELS_PACKED:
+                continue
+
+            channels = self.decode_crsf_rc_channels(payload)
+            channel_index = self.fc_aux_channel_index
+            if channel_index < 0 or not channels or len(channels) <= channel_index:
+                continue
+
+            aux = int(channels[channel_index])
+            with self.fc_lock:
+                self.selected_aux_value = aux
+                self.selected_aux_last_time = time.time()
+
+            self.update_fc_overlay_text()
 
     def parse_fc_msp_stream_bytes(self, data: bytes, parser_state: dict):
         for byte in data:
@@ -2375,6 +2530,7 @@ class UdpVideoWindow:
                 local_bind_port=self.bridge_local_bind_port,
                 verbose=self.bridge_verbose,
                 hex_dump=self.bridge_hex,
+                serial_rx_callback=self.handle_crsf_serial_bytes,
             )
             self.bridge.start()
             self.serial_dev = serial_dev_to_use
@@ -2769,6 +2925,9 @@ StartupWMClass={APP_ID}
         chk_fc_telemetry_show_osd.set_active(self.fc_telemetry_show_osd)
         fc_enable_grid.attach(chk_fc_telemetry_show_osd, 0, 1, 2, 1)
 
+        # Вибір AUX для майбутнього перемикання відеорежимів винесений
+        # у вкладку "Відеорежими". Тут залишається лише телеметрія польотника.
+
         fc_udp_frame, fc_udp_grid = self.make_section("UDP MSP")
         entry_fc_host = Gtk.Entry()
         entry_fc_host.set_text(self.fc_telemetry_host)
@@ -2798,6 +2957,69 @@ StartupWMClass={APP_ID}
         fc_page.pack_start(fc_udp_frame, False, False, 0)
         fc_page.pack_start(Gtk.Box(), True, True, 0)
         notebook.append_page(fc_page, Gtk.Label(label="Польотник"))
+
+        video_modes_page = Gtk.Grid()
+        video_modes_page.set_border_width(8)
+        video_modes_page.set_row_spacing(10)
+        video_modes_page.set_column_spacing(12)
+        video_modes_page.set_hexpand(True)
+        video_modes_page.set_vexpand(True)
+
+        video_modes_left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        video_modes_left.set_hexpand(True)
+        video_modes_left.set_vexpand(True)
+        video_modes_right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        video_modes_right.set_hexpand(True)
+        video_modes_right.set_vexpand(True)
+        video_modes_page.attach(video_modes_left, 0, 0, 1, 1)
+        video_modes_page.attach(video_modes_right, 1, 0, 1, 1)
+        video_modes_page.set_column_homogeneous(True)
+
+        video_modes_info_frame, video_modes_info_grid = self.make_section("Пояснення")
+        video_modes_info_label = Gtk.Label(
+            label=(
+                "Відеорежими — майбутні профілі картинки, які пізніше можна буде перемикати з пульта. "
+                "Зараз перемикання ще не реалізоване: програма лише перехоплює вибраний AUX з CRSF-потоку "
+                "і акуратно показує його поверх клієнтського OSD, не змінюючи основне OSD польотника."
+            )
+        )
+        video_modes_info_label.set_xalign(0.0)
+        video_modes_info_label.set_line_wrap(True)
+        video_modes_info_grid.attach(video_modes_info_label, 0, 0, 2, 1)
+
+        video_modes_aux_frame, video_modes_aux_grid = self.make_section("AUX для відеорежимів")
+        combo_video_aux_channel = Gtk.ComboBoxText()
+        combo_video_aux_channel.append("-1", "Не вибрано")
+        for aux_num in range(1, 13):
+            channel_index = aux_num + 3  # AUX1=CH5=index4
+            combo_video_aux_channel.append(str(channel_index), f"AUX{aux_num}")
+        combo_video_aux_channel.set_active_id(str(getattr(self, "fc_aux_channel_index", -1)))
+        self.add_labeled_row(video_modes_aux_grid, 0, "Канал перемикання:", combo_video_aux_channel)
+
+        spin_fc_aux_row = Gtk.SpinButton()
+        spin_fc_aux_row.set_range(0, FC_OSD_ROWS - 1)
+        spin_fc_aux_row.set_value(self.fc_aux_row)
+        self.add_labeled_row(video_modes_aux_grid, 1, "Рядок OSD:", spin_fc_aux_row)
+
+        spin_fc_aux_col = Gtk.SpinButton()
+        spin_fc_aux_col.set_range(0, FC_OSD_COLS - 1)
+        spin_fc_aux_col.set_value(self.fc_aux_col)
+        self.add_labeled_row(video_modes_aux_grid, 2, "Колонка OSD:", spin_fc_aux_col)
+
+        video_modes_future_frame, video_modes_future_grid = self.make_section("Профілі відео")
+        video_modes_future_label = Gtk.Label(
+            label="Поки режимів немає. Пізніше тут будуть профілі типу: Низька затримка, Дальність, Якість, Ніч."
+        )
+        video_modes_future_label.set_xalign(0.0)
+        video_modes_future_label.set_line_wrap(True)
+        video_modes_future_grid.attach(video_modes_future_label, 0, 0, 2, 1)
+
+        video_modes_left.pack_start(video_modes_info_frame, False, False, 0)
+        video_modes_left.pack_start(video_modes_aux_frame, False, False, 0)
+        video_modes_left.pack_start(Gtk.Box(), True, True, 0)
+        video_modes_right.pack_start(video_modes_future_frame, False, False, 0)
+        video_modes_right.pack_start(Gtk.Box(), True, True, 0)
+        notebook.append_page(video_modes_page, Gtk.Label(label="Відеорежими"))
 
         bridge_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         bridge_page.set_border_width(8)
@@ -2939,12 +3161,17 @@ StartupWMClass={APP_ID}
         def update_fc_widgets_state():
             enabled = chk_fc_telemetry_enabled.get_active()
             chk_fc_telemetry_show_osd.set_sensitive(enabled)
+            aux_selected = (combo_video_aux_channel.get_active_id() or "-1") != "-1"
+            combo_video_aux_channel.set_sensitive(True)
+            spin_fc_aux_row.set_sensitive(aux_selected)
+            spin_fc_aux_col.set_sensitive(aux_selected)
             entry_fc_host.set_sensitive(enabled)
             spin_fc_port.set_sensitive(enabled)
             spin_fc_heartbeat.set_sensitive(enabled)
             spin_fc_stale.set_sensitive(enabled)
 
         chk_fc_telemetry_enabled.connect("toggled", lambda *_: update_fc_widgets_state())
+        combo_video_aux_channel.connect("changed", lambda *_: update_fc_widgets_state())
 
         def apply_profile_to_widgets(profile_data):
             nonlocal widgets_sync_in_progress
@@ -3008,6 +3235,9 @@ StartupWMClass={APP_ID}
                 spin_fc_port.set_value(fc_telemetry["port"])
                 spin_fc_heartbeat.set_value(fc_telemetry["heartbeat_interval"])
                 spin_fc_stale.set_value(fc_telemetry["stale_timeout"])
+                combo_video_aux_channel.set_active_id(str(fc_telemetry.get("aux_channel", -1)))
+                spin_fc_aux_row.set_value(fc_telemetry.get("aux_row", 0))
+                spin_fc_aux_col.set_value(fc_telemetry.get("aux_col", 0))
 
                 update_osd_widgets_state()
                 update_fc_widgets_state()
@@ -3063,6 +3293,10 @@ StartupWMClass={APP_ID}
                         "port": spin_fc_port.get_value_as_int(),
                         "heartbeat_interval": spin_fc_heartbeat.get_value(),
                         "stale_timeout": spin_fc_stale.get_value(),
+                        "show_aux": (combo_video_aux_channel.get_active_id() or "-1") != "-1",
+                        "aux_channel": int(combo_video_aux_channel.get_active_id() or "-1"),
+                        "aux_row": spin_fc_aux_row.get_value_as_int(),
+                        "aux_col": spin_fc_aux_col.get_value_as_int(),
                     },
                 }
             )
@@ -3095,6 +3329,10 @@ StartupWMClass={APP_ID}
                 self.fc_telemetry_port,
                 self.fc_telemetry_heartbeat_interval,
                 self.fc_telemetry_stale_timeout,
+                self.fc_aux_channel_index,
+                self.fc_show_aux_osd,
+                self.fc_aux_row,
+                self.fc_aux_col,
             )
 
             self.active_profile_id = selected_profile_id
@@ -3135,6 +3373,10 @@ StartupWMClass={APP_ID}
                 self.fc_telemetry_port,
                 self.fc_telemetry_heartbeat_interval,
                 self.fc_telemetry_stale_timeout,
+                self.fc_aux_channel_index,
+                self.fc_show_aux_osd,
+                self.fc_aux_row,
+                self.fc_aux_col,
             )
             fc_telemetry_changed = fc_telemetry_state != prev_fc_telemetry_state
             if fc_telemetry_changed:
@@ -3142,6 +3384,8 @@ StartupWMClass={APP_ID}
                     self.fc_last_text = ""
                     self.fc_status_text = "FC: очікування телеметрії..." if self.fc_telemetry_enabled else "FC telemetry: вимкнено"
                     self.fc_last_packet_time = 0.0
+                    self.selected_aux_value = None
+                    self.selected_aux_last_time = 0.0
                 self.fc_reconnect_requested = True
 
             if not self.enable_telemetry_osd:

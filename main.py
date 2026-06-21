@@ -3588,6 +3588,12 @@ StartupWMClass={APP_ID}
         spin_fc_aux_col.set_value(self.fc_aux_col)
         self.add_labeled_row(video_modes_aux_grid, 3, "Колонка OSD:", spin_fc_aux_col)
 
+        spin_waybeam_port = Gtk.SpinButton()
+        spin_waybeam_port.set_range(1, 65535)
+        spin_waybeam_port.set_increments(1, 10)
+        spin_waybeam_port.set_value(getattr(self, "waybeam_api_port", 80))
+        self.add_labeled_row(video_modes_aux_grid, 4, "Порт WayBeam API:", spin_waybeam_port)
+
         # Video mode mapping table
         aux_bitrate_map_frame, aux_bitrate_map_grid = self.make_section("Відеорежими")
         aux_bitrate_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)

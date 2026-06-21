@@ -7,6 +7,7 @@ ENTRY_SCRIPT="main.py"
 ICON_FILE="prince_ground_station.png"
 PLACEHOLDER_FILE="vandam.png"
 FALLBACK_PLACEHOLDER="80dshv.png"
+FONT_FILE="font_btfl_hd.png"
 DESKTOP_FILE="${APP_NAME}.desktop"
 APPDIR="AppDir"
 VENV_DIR=".venv"
@@ -59,6 +60,10 @@ fi
 
 if [ -n "$ACTUAL_PLACEHOLDER_FILE" ]; then
   PYINSTALLER_ARGS+=(--add-data "${ACTUAL_PLACEHOLDER_FILE}:.")
+fi
+
+if [ -f "$FONT_FILE" ]; then
+  PYINSTALLER_ARGS+=(--add-data "${FONT_FILE}:.")
 fi
 
 echo "==> Building with PyInstaller..."

@@ -1134,6 +1134,7 @@ class UdpVideoWindow:
                 "mode": "rtp",
                 "decoder": "decodebin",
                 "always_on_top": True,
+                "waybeam_api_port": 80,
                 "modes": [
                     {
                         "name": "Low (512)",
@@ -1228,6 +1229,7 @@ class UdpVideoWindow:
                 "mode": "rtp",
                 "decoder": "decodebin",
                 "always_on_top": True,
+                "waybeam_api_port": 80,
                 "modes": [
                     {
                         "name": "Low (512)",
@@ -1365,6 +1367,7 @@ class UdpVideoWindow:
                 "mode": mode,
                 "decoder": decoder,
                 "always_on_top": bool(video.get("always_on_top", defaults["video"]["always_on_top"])),
+                "waybeam_api_port": max(1, min(65535, int(video.get("waybeam_api_port", defaults["video"]["waybeam_api_port"])))),
                 "modes": [
                     {
                         **m,
@@ -1434,6 +1437,7 @@ class UdpVideoWindow:
                     "mode": self.mode,
                     "decoder": self.video_decoder,
                     "always_on_top": self.always_on_top,
+                    "waybeam_api_port": self.waybeam_api_port,
                     "modes": self.fc_aux_bitrate_map,
                 },
                 "mikrotik": {
@@ -1484,6 +1488,7 @@ class UdpVideoWindow:
         self.mode = str(video.get("mode", "rtp"))
         self.video_decoder = str(video.get("decoder", DEFAULT_VIDEO_DECODER))
         self.always_on_top = bool(video.get("always_on_top", True))
+        self.waybeam_api_port = max(1, min(65535, int(video.get("waybeam_api_port", 80))))
 
         mikrotik = profile.get("mikrotik", {})
         self.mikrotik_host = str(mikrotik.get("host", "192.168.121.1"))
@@ -2313,10 +2318,11 @@ class UdpVideoWindow:
             return None
 
         parsed = urllib.parse.urlparse(host if "://" in host else f"http://{host}")
-        netloc = parsed.netloc or parsed.path
-        if not netloc:
+        hostname = parsed.hostname or (parsed.netloc or parsed.path).split(":")[0]
+        if not hostname:
             return None
-        return f"http://{netloc}"
+        port = getattr(self, "waybeam_api_port", 80) or 80
+        return f"http://{hostname}:{port}"
 
     def fc_waybeam_get_with_info(
         self,
@@ -4081,6 +4087,7 @@ StartupWMClass={APP_ID}
                 combo_video_mode.set_active_id(video["mode"])
                 combo_video_decoder.set_active_id(video["decoder"])
                 chk_always_on_top.set_active(video["always_on_top"])
+                spin_waybeam_port.set_value(video["waybeam_api_port"])
 
                 entry_mt_host.set_text(mikrotik["host"])
                 entry_mt_user.set_text(mikrotik["user"])
@@ -4139,6 +4146,7 @@ StartupWMClass={APP_ID}
                         "mode": combo_video_mode.get_active_id() or "rtp",
                         "decoder": combo_video_decoder.get_active_id() or DEFAULT_VIDEO_DECODER,
                         "always_on_top": chk_always_on_top.get_active(),
+                        "waybeam_api_port": spin_waybeam_port.get_value_as_int(),
                         "modes": self.fc_aux_bitrate_map,
                     },
                     "mikrotik": {

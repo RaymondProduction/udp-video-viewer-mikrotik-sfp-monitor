@@ -838,6 +838,8 @@ class UdpVideoWindow:
         self.selected_aux_value = None
         self.selected_aux_last_time = 0.0
         self.fc_canvas = None
+        self.fc_video_width = 0
+        self.fc_video_height = 0
         self.fc_font_surface = None
         self.fc_last_aux_mode_key = ""
         self.fc_last_aux_apply_ts = 0.0
@@ -1696,6 +1698,7 @@ class UdpVideoWindow:
             raise RuntimeError("Не вдалося знайти cairooverlay fc_canvas")
 
         self.fc_canvas.connect("draw", self.on_fc_canvas_draw)
+        self.fc_canvas.connect("caps-changed", self.on_fc_canvas_caps_changed)
         self.monitor_sink.connect("new-sample", self.on_monitor_new_sample)
 
         video_widget = self.video_sink.props.widget
@@ -2725,6 +2728,14 @@ class UdpVideoWindow:
             except Exception:
                 pass
         return False
+
+    def on_fc_canvas_caps_changed(self, _overlay, caps):
+        structure = caps.get_structure(0)
+        ok_w, w = structure.get_int("width")
+        ok_h, h = structure.get_int("height")
+        if ok_w and ok_h:
+            self.fc_video_width = w
+            self.fc_video_height = h
 
     def on_fc_canvas_draw(self, _overlay, context, _timestamp, _duration):
         if not self.fc_telemetry_enabled or not self.fc_telemetry_show_osd:

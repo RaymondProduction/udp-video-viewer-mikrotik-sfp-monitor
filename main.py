@@ -2566,7 +2566,10 @@ class UdpVideoWindow:
             payload.update(api_set)
 
         # IQ fields are applied via /api/v1/iq/set, not /api/v1/set.
-        iq_payload: Dict[str, Any] = {}
+        # WayBeam does not persist the nr_luma parameter in its config.
+        # It has to be reapplied each time.
+        # This reduces noise and flickering during runtime.
+        iq_payload: Dict[str, Any] = {"nr_luma": 100}
         if "saturation" in payload:
             iq_payload["saturation"] = payload.pop("saturation")
         if "iq.saturation" in payload:

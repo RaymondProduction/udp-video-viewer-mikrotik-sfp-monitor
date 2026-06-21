@@ -2743,9 +2743,8 @@ class UdpVideoWindow:
         if self.fc_font_surface is None:
             return
 
-        target = context.get_target()
-        width = target.get_width()
-        height = target.get_height()
+        width = self.fc_video_width
+        height = self.fc_video_height
         if width <= 0 or height <= 0:
             return
 

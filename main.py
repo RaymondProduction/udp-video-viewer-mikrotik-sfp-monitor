@@ -283,9 +283,11 @@ def list_serial_devices() -> List[Tuple[str, str]]:
     return items
 
 
-def find_controller_serial_device() -> Optional[str]:
+def find_jr_module_device() -> Optional[str]:
     for p in list_ports.comports():
         if p.manufacturer == "Raspberry Pi" and p.product == "Pico":
+            return p.device
+        if p.manufacturer == "Espressif" and p.product == "USB JTAG/serial debug unit":
             return p.device
     return None
 
@@ -1234,15 +1236,15 @@ class UdpVideoWindow:
                 "waybeam_api_port": 80,
                 "modes": [
                     {
-                        "name": "Low (512)",
+                        "name": "High (2560)",
                         "min": 0,
                         "max": 800,
-                        "bitrate": "512",
+                        "bitrate": "2560",
                         "api_set": {
                             "video0.fps": 25,
-                            "video0.bitrate": 512,
-                            "video0.gopSize": 0.12,
-                            "video0.qpDelta": -4,
+                            "video0.bitrate": 2560,
+                            "video0.gopSize": 0.08,
+                            "video0.qpDelta": 0,
                             "saturation": 50,
                         },
                     },
@@ -1252,24 +1254,24 @@ class UdpVideoWindow:
                         "max": 1500,
                         "bitrate": "1536",
                         "api_set": {
-                            "video0.fps": 30,
+                            "video0.fps": 25,
                             "video0.bitrate": 1536,
-                            "video0.gopSize": 0.067,
-                            "video0.qpDelta": -4,
+                            "video0.gopSize": 0.08,
+                            "video0.qpDelta": 0,
                             "saturation": 50,
                         },
                     },
-                    {
-                        "name": "High (3072)",
+                                        {
+                        "name": "Low (512)",
                         "min": 1000,
                         "max": 2000,
-                        "bitrate": "3072",
+                        "bitrate": "512",
                         "api_set": {
                             "video0.fps": 25,
-                            "video0.bitrate": 3072,
-                            "video0.gopSize": 0.12,
-                            "video0.qpDelta": -4,
-                            "saturation": 59,
+                            "video0.bitrate": 512,
+                            "video0.gopSize": 0.08,
+                            "video0.qpDelta": 0,
+                            "saturation": 50,
                         },
                     },
                 ],
@@ -3108,7 +3110,7 @@ class UdpVideoWindow:
         serial_dev_to_use = self.serial_dev
 
         if not serial_dev_to_use and self.auto_controller_enabled:
-            serial_dev_to_use = find_controller_serial_device()
+            serial_dev_to_use = find_jr_module_device()
 
         if not serial_dev_to_use:
             return
@@ -3148,7 +3150,7 @@ class UdpVideoWindow:
 
         while self.running:
             try:
-                found = find_controller_serial_device() if self.auto_controller_enabled else self.serial_dev
+                found = find_jr_module_device() if self.auto_controller_enabled else self.serial_dev
 
                 if found != last_seen:
                     if found:
@@ -3641,7 +3643,7 @@ StartupWMClass={APP_ID}
 
         frame_serial, grid_serial = self.make_section("Serial")
         combo_serial_dev = Gtk.ComboBoxText()
-        combo_serial_dev.append("__auto__", "Auto (автопошук Raspberry Pi Pico)")
+        combo_serial_dev.append("__auto__", "Auto (автопошук JR модуля)")
         current_serial_items = list_serial_devices()
         selected_serial_id = "__auto__" if not self.serial_dev else self.serial_dev
         found_selected = selected_serial_id == "__auto__"

@@ -849,6 +849,13 @@ class UdpVideoWindow:
         self.fc_aux_apply_lock = threading.Lock()
         self.fc_aux_apply_in_progress = False
         self.fc_aux_pending_request = None
+        self.zoom_last_mode_key = ""
+        self.zoom_last_apply_ts = 0.0
+        self.zoom_apply_min_interval_sec = 0.8
+        self.zoom_apply_lock = threading.Lock()
+        self.zoom_apply_in_progress = False
+        self.zoom_pending_request = None
+        self.selected_zoom_aux_value = None
         self.fc_capabilities_cache = {}
         self.fc_capabilities_last_ts = 0.0
         fc_font_path = first_existing_path([
@@ -1199,6 +1206,26 @@ class UdpVideoWindow:
                 "aux_row": 0,
                 "aux_col": 0,
             },
+            "zoom": {
+                "aux_channel": -1,
+                "size_api_port": 8765,
+                "modes": [
+                    {
+                        "name": "Normal",
+                        "min": 0,
+                        "max": 1000,
+                        "size": "1024x576",
+                        "framing": "off",
+                    },
+                    {
+                        "name": "Zoom 2x",
+                        "min": 1001,
+                        "max": 2000,
+                        "size": "2560x1440",
+                        "framing": "zoom-2x",
+                    },
+                ],
+            },
         }
 
     def get_starlink_profile_definition(self):
@@ -1294,6 +1321,26 @@ class UdpVideoWindow:
                 "aux_row": 0,
                 "aux_col": 0,
             },
+            "zoom": {
+                "aux_channel": -1,
+                "size_api_port": 8765,
+                "modes": [
+                    {
+                        "name": "Normal",
+                        "min": 0,
+                        "max": 1000,
+                        "size": "1024x576",
+                        "framing": "off",
+                    },
+                    {
+                        "name": "Zoom 2x",
+                        "min": 1001,
+                        "max": 2000,
+                        "size": "2560x1440",
+                        "framing": "zoom-2x",
+                    },
+                ],
+            },
         }
 
     def get_builtin_profiles(self):
@@ -1311,6 +1358,7 @@ class UdpVideoWindow:
         video = data.get("video", {}) if isinstance(data, dict) else {}
         mikrotik = data.get("mikrotik", {}) if isinstance(data, dict) else {}
         fc_telemetry = data.get("fc_telemetry", {}) if isinstance(data, dict) else {}
+        zoom_raw = data.get("zoom", {}) if isinstance(data, dict) else {}
         modes_source = video.get("modes")
         if not isinstance(modes_source, list):
             # Backward compatibility with old profile schema.
@@ -1406,6 +1454,15 @@ class UdpVideoWindow:
                 "aux_row": int(fc_telemetry.get("aux_row", defaults["fc_telemetry"].get("aux_row", 0))),
                 "aux_col": int(fc_telemetry.get("aux_col", defaults["fc_telemetry"].get("aux_col", 0))),
             },
+            "zoom": {
+                "aux_channel": max(-1, min(15, int(zoom_raw.get("aux_channel", defaults["zoom"]["aux_channel"])))),
+                "size_api_port": max(1, min(65535, int(zoom_raw.get("size_api_port", defaults["zoom"]["size_api_port"])))),
+                "modes": [
+                    {**m}
+                    for m in (zoom_raw.get("modes") or defaults["zoom"]["modes"])
+                    if isinstance(m, dict) and "min" in m and "max" in m
+                ],
+            },
         }
 
     def export_current_profile_data(self):
@@ -1462,6 +1519,11 @@ class UdpVideoWindow:
                     "aux_row": self.fc_aux_row,
                     "aux_col": self.fc_aux_col,
                 },
+                "zoom": {
+                    "aux_channel": self.zoom_aux_channel_index,
+                    "size_api_port": self.zoom_size_api_port,
+                    "modes": self.zoom_aux_map,
+                },
             }
         )
 
@@ -1512,6 +1574,11 @@ class UdpVideoWindow:
         self.fc_aux_row = max(0, min(FC_OSD_ROWS - 1, int(fc_telemetry.get("aux_row", 0))))
         self.fc_aux_col = max(0, min(FC_OSD_COLS - 1, int(fc_telemetry.get("aux_col", 0))))
         self.fc_aux_bitrate_map = video.get("modes", fc_telemetry.get("aux_bitrate_map", []))
+
+        zoom = profile.get("zoom", {})
+        self.zoom_aux_channel_index = max(-1, min(15, int(zoom.get("aux_channel", -1))))
+        self.zoom_size_api_port = max(1, min(65535, int(zoom.get("size_api_port", 8765))))
+        self.zoom_aux_map = zoom.get("modes", [])
 
         bridge = profile.get("bridge", {})
         self.serial_dev = bridge.get("serial_dev") or None
@@ -2692,6 +2759,99 @@ class UdpVideoWindow:
 
         threading.Thread(target=worker_loop, daemon=True).start()
 
+    def fc_waybeam_size_api_base_url(self) -> Optional[str]:
+        host = (self.bridge_remote_host or "").strip()
+        if not host:
+            return None
+        parsed = urllib.parse.urlparse(host if "://" in host else f"http://{host}")
+        hostname = parsed.hostname or (parsed.netloc or parsed.path).split(":")[0]
+        if not hostname:
+            return None
+        port = getattr(self, "zoom_size_api_port", 8765) or 8765
+        return f"http://{hostname}:{port}"
+
+    def fc_waybeam_size_set(self, size: str, framing: str) -> bool:
+        base_url = self.fc_waybeam_size_api_base_url()
+        if not base_url:
+            print("[WARN] ZOOM SIZE SET skipped: bridge_remote_host is empty", file=sys.stderr)
+            return False
+        size_enc = urllib.parse.quote(size, safe="")
+        framing_enc = urllib.parse.quote(framing, safe="")
+        path = f"/set?size={size_enc}&framing={framing_enc}"
+        url = f"{base_url}{path}"
+        print(f"[INFO] ZOOM SIZE SET -> {url}", flush=True)
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                raw = resp.read(700)
+                body = raw.decode("utf-8", errors="ignore").strip()
+                ok = 200 <= int(resp.status) < 300
+                if ok:
+                    print(f"[INFO] ZOOM SIZE RESP <- {resp.status}: {body[:220]}", flush=True)
+                else:
+                    print(f"[WARN] ZOOM SIZE RESP <- {resp.status}: {body[:220]}", file=sys.stderr)
+                return ok
+        except Exception as e:
+            print(f"[WARN] ZOOM SIZE SET failed: {url} ({e})", file=sys.stderr)
+            return False
+
+    def fc_get_zoom_mode_mapping(self, aux_value: int) -> Tuple[str, Optional[Dict[str, Any]]]:
+        with self.fc_lock:
+            aux_map = list(getattr(self, "zoom_aux_map", []) or [])
+        for index, mapping in enumerate(aux_map):
+            if not isinstance(mapping, dict):
+                continue
+            if "min" not in mapping or "max" not in mapping:
+                continue
+            min_val = int(mapping.get("min", 0))
+            max_val = int(mapping.get("max", 0))
+            if min_val > max_val:
+                min_val, max_val = max_val, min_val
+            if min_val <= aux_value <= max_val:
+                name = str(mapping.get("name", f"zoom-{index + 1}"))
+                return f"{index}:{name}:{min_val}-{max_val}", mapping
+        return "__none__", None
+
+    def fc_handle_aux_zoom_switch(self, aux_value: int):
+        mode_key, mapping = self.fc_get_zoom_mode_mapping(aux_value)
+        now = time.time()
+        if mapping is None:
+            return
+        with self.zoom_apply_lock:
+            if mode_key == self.zoom_last_mode_key:
+                return
+            if now - self.zoom_last_apply_ts < self.zoom_apply_min_interval_sec:
+                return
+            self.zoom_last_mode_key = mode_key
+            self.zoom_last_apply_ts = now
+            self.zoom_pending_request = (mode_key, mapping)
+            if self.zoom_apply_in_progress:
+                return
+            self.zoom_apply_in_progress = True
+
+        def worker_loop():
+            try:
+                while True:
+                    with self.zoom_apply_lock:
+                        pending = self.zoom_pending_request
+                        self.zoom_pending_request = None
+                    if pending is None:
+                        break
+                    p_mode_key, p_mapping = pending
+                    size = str(p_mapping.get("size", "")).strip()
+                    framing = str(p_mapping.get("framing", "")).strip()
+                    if size and framing:
+                        print(
+                            f"[INFO] ZOOM mode apply: key={p_mode_key}, size={size}, framing={framing}",
+                            flush=True,
+                        )
+                        self.fc_waybeam_size_set(size, framing)
+            finally:
+                with self.zoom_apply_lock:
+                    self.zoom_apply_in_progress = False
+
+        threading.Thread(target=worker_loop, daemon=True).start()
+
     def fc_write_osd_bytes(self, row: int, col: int, data_bytes: bytes):
         if row >= FC_OSD_ROWS or col >= FC_OSD_COLS:
             return
@@ -2897,17 +3057,23 @@ class UdpVideoWindow:
                 continue
 
             channels = self.decode_crsf_rc_channels(payload)
-            channel_index = self.fc_aux_channel_index
-            if channel_index < 0 or not channels or len(channels) <= channel_index:
+            if not channels:
                 continue
 
-            aux = int(channels[channel_index])
-            with self.fc_lock:
-                self.selected_aux_value = aux
-                self.selected_aux_last_time = time.time()
+            video_channel = self.fc_aux_channel_index
+            if video_channel >= 0 and len(channels) > video_channel:
+                aux = int(channels[video_channel])
+                with self.fc_lock:
+                    self.selected_aux_value = aux
+                    self.selected_aux_last_time = time.time()
+                self.fc_handle_aux_mode_switch(aux)
+                self.update_fc_overlay_text()
 
-            self.fc_handle_aux_mode_switch(aux)
-            self.update_fc_overlay_text()
+            zoom_channel = getattr(self, "zoom_aux_channel_index", -1)
+            if zoom_channel >= 0 and len(channels) > zoom_channel:
+                zoom_aux = int(channels[zoom_channel])
+                self.selected_zoom_aux_value = zoom_aux
+                self.fc_handle_aux_zoom_switch(zoom_aux)
 
     def parse_fc_msp_stream_bytes(self, data: bytes, parser_state: dict):
         for byte in data:
@@ -3624,6 +3790,70 @@ StartupWMClass={APP_ID}
         aux_bitrate_map_frame.set_hexpand(True)
         notebook.append_page(video_modes_page, Gtk.Label(label="Відеорежими"))
 
+        # ── Вкладка "Зум" ─────────────────────────────────────────────
+        zoom_page = Gtk.Grid()
+        zoom_page.set_border_width(8)
+        zoom_page.set_row_spacing(10)
+        zoom_page.set_column_spacing(12)
+        zoom_page.set_hexpand(True)
+        zoom_page.set_vexpand(True)
+        zoom_page.set_column_homogeneous(True)
+
+        zoom_info_frame, zoom_info_grid = self.make_section("Пояснення")
+        zoom_info_label = Gtk.Label(
+            label=(
+                "Перемикає розмір та framing камери через waybeam_api (/set?size=...&framing=...) "
+                "за сигналом AUX з пульта.\n\n"
+                "Стандартні позиції: Normal (size=1024x576, framing=off) і Zoom 2x (size=2560x1440, framing=zoom-2x).\n"
+                "Порт за замовчуванням 8765 — це waybeam_api, не основний API камери."
+            )
+        )
+        zoom_info_label.set_xalign(0.0)
+        zoom_info_label.set_line_wrap(True)
+        zoom_info_grid.attach(zoom_info_label, 0, 0, 2, 1)
+
+        zoom_aux_frame, zoom_aux_grid = self.make_section("AUX для зуму")
+        combo_zoom_aux_channel = Gtk.ComboBoxText()
+        combo_zoom_aux_channel.append("-1", "Не вибрано")
+        for aux_num in range(1, 13):
+            channel_index = aux_num + 3
+            combo_zoom_aux_channel.append(str(channel_index), f"AUX{aux_num}")
+        combo_zoom_aux_channel.set_active_id(str(getattr(self, "zoom_aux_channel_index", -1)))
+        self.add_labeled_row(zoom_aux_grid, 0, "Канал зуму:", combo_zoom_aux_channel)
+
+        label_current_zoom_aux = Gtk.Label(label="Поточне значення: ---")
+        label_current_zoom_aux.set_hexpand(True)
+        self.add_labeled_row(zoom_aux_grid, 1, "AUX значення:", label_current_zoom_aux)
+
+        spin_zoom_size_api_port = Gtk.SpinButton()
+        spin_zoom_size_api_port.set_range(1, 65535)
+        spin_zoom_size_api_port.set_increments(1, 10)
+        spin_zoom_size_api_port.set_value(getattr(self, "zoom_size_api_port", 8765))
+        self.add_labeled_row(zoom_aux_grid, 2, "Порт waybeam_api:", spin_zoom_size_api_port)
+
+        zoom_modes_frame, zoom_modes_grid = self.make_section("Режими зуму")
+        zoom_modes_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        button_add_zoom = Gtk.Button(label="+ Додати режим зуму")
+        button_add_zoom.set_hexpand(True)
+        zoom_modes_container.pack_start(button_add_zoom, False, False, 0)
+
+        zoom_modes_scroll = Gtk.ScrolledWindow()
+        zoom_modes_scroll.set_hexpand(True)
+        zoom_modes_scroll.set_vexpand(True)
+        zoom_modes_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        zoom_modes_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        zoom_modes_scroll.add(zoom_modes_list_box)
+        zoom_modes_container.pack_start(zoom_modes_scroll, True, True, 0)
+
+        zoom_modes_grid.attach(zoom_modes_container, 0, 0, 2, 1)
+
+        zoom_page.attach(zoom_info_frame, 0, 0, 1, 1)
+        zoom_page.attach(zoom_aux_frame, 1, 0, 1, 1)
+        zoom_page.attach(zoom_modes_frame, 0, 1, 2, 1)
+        zoom_modes_frame.set_hexpand(True)
+        notebook.append_page(zoom_page, Gtk.Label(label="Зум"))
+
         bridge_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         bridge_page.set_border_width(8)
 
@@ -4028,6 +4258,135 @@ StartupWMClass={APP_ID}
             ),
         )
 
+        # ── Zoom mode rows ─────────────────────────────────────────────
+        VALID_FRAMING_OPTIONS = [
+            "off", "stab", "stab-fill",
+            "zoom-1.25x", "zoom-1.50x", "zoom-1.75x",
+            "zoom-2x", "zoom-3x", "zoom-4x",
+        ]
+        zoom_mode_rows: List[dict] = []
+
+        def sync_zoom_map_from_rows(mark_custom=False):
+            aux_map = []
+            for row in zoom_mode_rows:
+                min_val = row["min"].get_value_as_int()
+                max_val = row["max"].get_value_as_int()
+                if min_val > max_val:
+                    min_val, max_val = max_val, min_val
+                aux_map.append({
+                    "name": row["name"].get_text().strip(),
+                    "min": min_val,
+                    "max": max_val,
+                    "size": row["size"].get_text().strip(),
+                    "framing": row["framing"].get_active_id() or "off",
+                })
+            self.zoom_aux_map = aux_map
+            if mark_custom and not widgets_sync_in_progress:
+                mark_profile_as_custom()
+
+        def add_zoom_mode_row(mapping=None, mark_custom=False):
+            mapping = mapping or {}
+            row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+            entry_name = Gtk.Entry()
+            entry_name.set_placeholder_text("Назва")
+            entry_name.set_text(str(mapping.get("name", f"Зум {len(zoom_mode_rows) + 1}")))
+            entry_name.set_hexpand(True)
+            entry_name.set_width_chars(10)
+
+            spin_min = Gtk.SpinButton()
+            spin_min.set_range(0, 3000)
+            spin_min.set_increments(1, 10)
+            spin_min.set_value(int(mapping.get("min", 0)))
+            spin_min.set_width_chars(4)
+
+            spin_max = Gtk.SpinButton()
+            spin_max.set_range(0, 3000)
+            spin_max.set_increments(1, 10)
+            spin_max.set_value(int(mapping.get("max", 1000)))
+            spin_max.set_width_chars(4)
+
+            entry_size = Gtk.Entry()
+            entry_size.set_text(str(mapping.get("size", "1024x576")))
+            entry_size.set_width_chars(12)
+            entry_size.set_placeholder_text("напр. 2560x1440")
+
+            combo_framing = Gtk.ComboBoxText()
+            for f in VALID_FRAMING_OPTIONS:
+                combo_framing.append(f, f)
+            framing_val = str(mapping.get("framing", "off"))
+            combo_framing.set_active_id(framing_val if framing_val in VALID_FRAMING_OPTIONS else "off")
+
+            button_remove = Gtk.Button()
+            button_remove.set_image(
+                Gtk.Image.new_from_icon_name("user-trash-symbolic", Gtk.IconSize.BUTTON)
+            )
+            button_remove.set_relief(Gtk.ReliefStyle.NONE)
+            button_remove.set_tooltip_text("Видалити режим")
+
+            row_box.pack_start(entry_name, True, True, 0)
+            row_box.pack_start(spin_min, False, False, 0)
+            row_box.pack_start(Gtk.Label(label="-"), False, False, 0)
+            row_box.pack_start(spin_max, False, False, 0)
+            row_box.pack_start(entry_size, False, False, 0)
+            row_box.pack_start(combo_framing, False, False, 0)
+            row_box.pack_start(button_remove, False, False, 0)
+
+            row_state = {
+                "box": row_box,
+                "name": entry_name,
+                "min": spin_min,
+                "max": spin_max,
+                "size": entry_size,
+                "framing": combo_framing,
+            }
+            zoom_mode_rows.append(row_state)
+            zoom_modes_list_box.pack_start(row_box, False, False, 0)
+
+            entry_name.connect("changed", lambda *_: sync_zoom_map_from_rows(mark_custom=True))
+            entry_size.connect("changed", lambda *_: sync_zoom_map_from_rows(mark_custom=True))
+            combo_framing.connect("changed", lambda *_: sync_zoom_map_from_rows(mark_custom=True))
+            spin_min.connect("value-changed", lambda *_: sync_zoom_map_from_rows(mark_custom=True))
+            spin_max.connect("value-changed", lambda *_: sync_zoom_map_from_rows(mark_custom=True))
+
+            def remove_row(_button):
+                if row_state in zoom_mode_rows:
+                    zoom_mode_rows.remove(row_state)
+                zoom_modes_list_box.remove(row_box)
+                zoom_modes_list_box.show_all()
+                sync_zoom_map_from_rows(mark_custom=True)
+
+            button_remove.connect("clicked", remove_row)
+            zoom_modes_list_box.show_all()
+            sync_zoom_map_from_rows(mark_custom=mark_custom)
+
+        def load_zoom_mode_rows(mappings):
+            for row_state in list(zoom_mode_rows):
+                zoom_modes_list_box.remove(row_state["box"])
+            zoom_mode_rows.clear()
+            for mapping in mappings or []:
+                if not isinstance(mapping, dict):
+                    continue
+                if not all(k in mapping for k in ("min", "max")):
+                    continue
+                add_zoom_mode_row(mapping, mark_custom=False)
+            zoom_modes_list_box.show_all()
+            sync_zoom_map_from_rows(mark_custom=False)
+
+        button_add_zoom.connect(
+            "clicked",
+            lambda *_: add_zoom_mode_row(
+                {
+                    "name": f"Зум {len(zoom_mode_rows) + 1}",
+                    "min": 0,
+                    "max": 1000,
+                    "size": "1024x576",
+                    "framing": "off",
+                },
+                mark_custom=True,
+            ),
+        )
+
         def update_osd_widgets_state():
             enabled = chk_enable_telemetry_osd.get_active()
 
@@ -4126,6 +4485,11 @@ StartupWMClass={APP_ID}
                 spin_fc_aux_col.set_value(fc_telemetry.get("aux_col", 0))
                 load_video_mode_rows(video.get("modes", fc_telemetry.get("aux_bitrate_map", [])))
 
+                zoom = profile_data.get("zoom", {})
+                combo_zoom_aux_channel.set_active_id(str(zoom.get("aux_channel", -1)))
+                spin_zoom_size_api_port.set_value(zoom.get("size_api_port", 8765))
+                load_zoom_mode_rows(zoom.get("modes", []))
+
                 update_osd_widgets_state()
                 update_fc_widgets_state()
             finally:
@@ -4187,6 +4551,11 @@ StartupWMClass={APP_ID}
                         "aux_channel": int(combo_video_aux_channel.get_active_id() or "-1"),
                         "aux_row": spin_fc_aux_row.get_value_as_int(),
                         "aux_col": spin_fc_aux_col.get_value_as_int(),
+                    },
+                    "zoom": {
+                        "aux_channel": int(combo_zoom_aux_channel.get_active_id() or "-1"),
+                        "size_api_port": spin_zoom_size_api_port.get_value_as_int(),
+                        "modes": self.zoom_aux_map,
                     },
                 }
             )
@@ -4277,6 +4646,11 @@ StartupWMClass={APP_ID}
                     self.selected_aux_value = None
                     self.selected_aux_last_time = 0.0
                 self.fc_reconnect_requested = True
+
+            # Reset zoom mode key so the new channel triggers immediately on first packet.
+            with self.zoom_apply_lock:
+                self.zoom_last_mode_key = ""
+            self.selected_zoom_aux_value = None
 
             if not self.enable_telemetry_osd:
                 self.disable_mikrotik_runtime()
@@ -4371,6 +4745,8 @@ StartupWMClass={APP_ID}
             combo_video_aux_channel,
             spin_fc_aux_row,
             spin_fc_aux_col,
+            combo_zoom_aux_channel,
+            spin_zoom_size_api_port,
         ]
 
         for watched_widget in widgets_to_watch:
@@ -4391,7 +4767,7 @@ StartupWMClass={APP_ID}
         )
         dialog.show_all()
 
-        # Timer to update AUX label
+        # Timer to update AUX labels
         def update_aux_label():
             if label_current_aux:
                 with self.fc_lock:
@@ -4400,6 +4776,12 @@ StartupWMClass={APP_ID}
                     label_current_aux.set_text(f"Поточне значення: {aux_val}")
                 else:
                     label_current_aux.set_text("Поточне значення: ---")
+            zoom_aux_val = self.selected_zoom_aux_value
+            if label_current_zoom_aux:
+                if zoom_aux_val is not None:
+                    label_current_zoom_aux.set_text(f"Поточне значення: {zoom_aux_val}")
+                else:
+                    label_current_zoom_aux.set_text("Поточне значення: ---")
             return True
 
         timer_id = GLib.timeout_add(500, update_aux_label)

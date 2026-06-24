@@ -1212,14 +1212,14 @@ class UdpVideoWindow:
                 "modes": [
                     {
                         "name": "Normal",
-                        "min": 0,
-                        "max": 1000,
+                        "min": 1200,
+                        "max": 1600,
                         "size": "1024x576",
                         "framing": "off",
                     },
                     {
                         "name": "Zoom 2x",
-                        "min": 1001,
+                        "min": 1601,
                         "max": 2000,
                         "size": "2560x1440",
                         "framing": "zoom-2x",
@@ -1327,14 +1327,14 @@ class UdpVideoWindow:
                 "modes": [
                     {
                         "name": "Normal",
-                        "min": 0,
-                        "max": 1000,
+                        "min": 1200,
+                        "max": 1600,
                         "size": "1024x576",
                         "framing": "off",
                     },
                     {
                         "name": "Zoom 2x",
-                        "min": 1001,
+                        "min": 1601,
                         "max": 2000,
                         "size": "2560x1440",
                         "framing": "zoom-2x",

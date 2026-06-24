@@ -3762,7 +3762,6 @@ StartupWMClass={APP_ID}
         spin_waybeam_port.set_range(1, 65535)
         spin_waybeam_port.set_increments(1, 10)
         spin_waybeam_port.set_value(getattr(self, "waybeam_api_port", 80))
-        self.add_labeled_row(video_modes_aux_grid, 4, "Порт WayBeam API:", spin_waybeam_port)
 
         # Video mode mapping table
         aux_bitrate_map_frame, aux_bitrate_map_grid = self.make_section("Відеорежими")
@@ -3788,24 +3787,32 @@ StartupWMClass={APP_ID}
         video_modes_page.attach(video_modes_aux_frame, 1, 0, 1, 1)
         video_modes_page.attach(aux_bitrate_map_frame, 0, 1, 2, 1)
         aux_bitrate_map_frame.set_hexpand(True)
-        notebook.append_page(video_modes_page, Gtk.Label(label="Відеорежими"))
+        # video_modes_page added to camera_inner_nb below
 
         # ── Вкладка "Зум" ─────────────────────────────────────────────
-        zoom_page = Gtk.Grid()
-        zoom_page.set_border_width(8)
-        zoom_page.set_row_spacing(10)
-        zoom_page.set_column_spacing(12)
-        zoom_page.set_hexpand(True)
-        zoom_page.set_vexpand(True)
-        zoom_page.set_column_homogeneous(True)
+        camera_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        camera_page.set_border_width(0)
+        camera_inner_nb = Gtk.Notebook()
+        camera_inner_nb.set_tab_pos(Gtk.PositionType.TOP)
+        camera_inner_nb.set_hexpand(True)
+        camera_inner_nb.set_vexpand(True)
+        camera_page.pack_start(camera_inner_nb, True, True, 0)
+
+        zoom_tab = Gtk.Grid()
+        zoom_tab.set_border_width(8)
+        zoom_tab.set_row_spacing(10)
+        zoom_tab.set_column_spacing(12)
+        zoom_tab.set_hexpand(True)
+        zoom_tab.set_vexpand(True)
+        zoom_tab.set_column_homogeneous(True)
 
         zoom_info_frame, zoom_info_grid = self.make_section("Пояснення")
         zoom_info_label = Gtk.Label(
             label=(
-                "Перемикає розмір та framing камери через waybeam_api (/set?size=...&framing=...) "
+                "Перемикає розмір та framing камери через Custom API (/set?size=...&framing=...) "
                 "за сигналом AUX з пульта.\n\n"
                 "Стандартні позиції: Normal (size=1024x576, framing=off) і Zoom 2x (size=2560x1440, framing=zoom-2x).\n"
-                "Порт за замовчуванням 8765 — це waybeam_api, не основний API камери."
+                "Custom API — додаткове API камери, що розширює можливості керування. Порт налаштовується у вкладці «Параметри»."
             )
         )
         zoom_info_label.set_xalign(0.0)
@@ -3829,7 +3836,6 @@ StartupWMClass={APP_ID}
         spin_zoom_size_api_port.set_range(1, 65535)
         spin_zoom_size_api_port.set_increments(1, 10)
         spin_zoom_size_api_port.set_value(getattr(self, "zoom_size_api_port", 8765))
-        self.add_labeled_row(zoom_aux_grid, 2, "Порт waybeam_api:", spin_zoom_size_api_port)
 
         zoom_modes_frame, zoom_modes_grid = self.make_section("Режими зуму")
         zoom_modes_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -3848,11 +3854,11 @@ StartupWMClass={APP_ID}
 
         zoom_modes_grid.attach(zoom_modes_container, 0, 0, 2, 1)
 
-        zoom_page.attach(zoom_info_frame, 0, 0, 1, 1)
-        zoom_page.attach(zoom_aux_frame, 1, 0, 1, 1)
-        zoom_page.attach(zoom_modes_frame, 0, 1, 2, 1)
+        zoom_tab.attach(zoom_info_frame, 0, 0, 1, 1)
+        zoom_tab.attach(zoom_aux_frame, 1, 0, 1, 1)
+        zoom_tab.attach(zoom_modes_frame, 0, 1, 2, 1)
         zoom_modes_frame.set_hexpand(True)
-        notebook.append_page(zoom_page, Gtk.Label(label="Зум"))
+        camera_inner_nb.append_page(zoom_tab, Gtk.Label(label="Зум"))
 
         bridge_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         bridge_page.set_border_width(8)
@@ -3935,8 +3941,8 @@ StartupWMClass={APP_ID}
         logs_page.pack_start(frame_logs, False, False, 0)
         logs_page.pack_start(Gtk.Box(), True, True, 0)
 
-        video_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        video_page.set_border_width(8)
+        video_tab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        video_tab.set_border_width(8)
 
         frame_video_main, grid_video_main = self.make_section("Основне")
         spin_video_port = Gtk.SpinButton()
@@ -3963,10 +3969,35 @@ StartupWMClass={APP_ID}
         chk_always_on_top.set_active(self.always_on_top)
         grid_window_behavior.attach(chk_always_on_top, 0, 0, 2, 1)
 
-        video_page.pack_start(frame_video_main, False, False, 0)
-        video_page.pack_start(frame_window_behavior, False, False, 0)
-        video_page.pack_start(Gtk.Box(), True, True, 0)
-        notebook.append_page(video_page, Gtk.Label(label="Відеопотік"))
+        video_tab.pack_start(frame_video_main, False, False, 0)
+        video_tab.pack_start(frame_window_behavior, False, False, 0)
+        video_tab.pack_start(Gtk.Box(), True, True, 0)
+        camera_inner_nb.append_page(video_tab, Gtk.Label(label="Відеопотік"))
+
+        params_tab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        params_tab.set_border_width(8)
+
+        frame_camera_api, grid_camera_api = self.make_section("API камери")
+        api_info_label = Gtk.Label(
+            label=(
+                "WayBeam API (порт 80 за замовчуванням) — основне API для керування відеорежимами.\n\n"
+                "Custom API (порт 8765 за замовчуванням) — додаткове API камери, що розширює можливості "
+                "керування: перемикання розміру зображення, framing, зум тощо."
+            )
+        )
+        api_info_label.set_xalign(0.0)
+        api_info_label.set_line_wrap(True)
+        grid_camera_api.attach(api_info_label, 0, 0, 2, 1)
+        self.add_labeled_row(grid_camera_api, 1, "Порт WayBeam API:", spin_waybeam_port)
+        self.add_labeled_row(grid_camera_api, 2, "Порт Custom API:", spin_zoom_size_api_port)
+
+        params_tab.pack_start(frame_camera_api, False, False, 0)
+        params_tab.pack_start(Gtk.Box(), True, True, 0)
+
+        camera_inner_nb.append_page(params_tab, Gtk.Label(label="Параметри"))
+        camera_inner_nb.insert_page(video_modes_page, Gtk.Label(label="Відеорежими"), 0)
+        camera_inner_nb.set_current_page(0)
+        notebook.append_page(camera_page, Gtk.Label(label="Камера"))
         notebook.append_page(bridge_page, Gtk.Label(label="Міст керування"))
         notebook.append_page(mt_osd_page, Gtk.Label(label="MikroTik / SFP"))
         notebook.append_page(logs_page, Gtk.Label(label="Логи"))
@@ -4747,6 +4778,7 @@ StartupWMClass={APP_ID}
             spin_fc_aux_col,
             combo_zoom_aux_channel,
             spin_zoom_size_api_port,
+            spin_waybeam_port,
         ]
 
         for watched_widget in widgets_to_watch:

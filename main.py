@@ -2638,7 +2638,7 @@ class UdpVideoWindow:
         # WayBeam does not persist the nr_luma parameter in its config.
         # It has to be reapplied each time.
         # This reduces noise and flickering during runtime.
-        iq_payload: Dict[str, Any] = {"nr_luma": 100}
+        iq_payload: Dict[str, Any] = {"nr_luma": 250}
         if "saturation" in payload:
             iq_payload["saturation"] = payload.pop("saturation")
         if "iq.saturation" in payload:

@@ -1,1 +1,1 @@
-arm-linux-gnueabihf-gcc -O2 -static -o custom_api custom_api.c
+arm-linux-gnueabihf-gcc -O2 -o custom_api custom_api.c

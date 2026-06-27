@@ -823,6 +823,11 @@ class UdpVideoWindow:
         self.majestic_restart_debounce_sec = 3.0
         self.btn_restart_mj = None
 
+        self.camera_flip = True
+        self.camera_mirror = True
+        self.camera_image_lock = threading.Lock()
+        self.btn_flip_mirror = None
+
         self.waiting_for_majestic_stream = False
         self.majestic_stream_deadline = 0.0
         self.majestic_stream_recovery_attempted = False
@@ -904,6 +909,11 @@ class UdpVideoWindow:
         self.btn_restart_mj.set_tooltip_text("Оновити відеопотік")
         self.btn_restart_mj.connect("clicked", self.on_restart_majestic_clicked)
         self.top_bar.pack_start(self.btn_restart_mj, False, False, 0)
+
+        self.btn_flip_mirror = Gtk.Button(label=" ↕")
+        self.btn_flip_mirror.set_tooltip_text("Flip/Mirror: завантаження...")
+        self.btn_flip_mirror.connect("clicked", self.on_flip_mirror_clicked)
+        self.top_bar.pack_start(self.btn_flip_mirror, False, False, 0)
 
         btn_settings = Gtk.Button()
         btn_settings.set_image(Gtk.Image.new_from_icon_name("emblem-system-symbolic", Gtk.IconSize.BUTTON))
@@ -998,6 +1008,7 @@ class UdpVideoWindow:
             self.ensure_bridge_running()
 
         self.window.show_all()
+        GLib.timeout_add(1500, self._fetch_camera_config_once)
         alloc = self.video_overlay.get_allocation()
         self.update_placeholder_image_size(alloc.width, alloc.height)
 
@@ -1970,6 +1981,83 @@ class UdpVideoWindow:
         GLib.timeout_add(int(self.majestic_restart_debounce_sec * 1000), self.set_restart_majestic_button_enabled, True)
         return False
 
+    def _flip_mirror_tooltip(self, flip: bool, mirror: bool) -> str:
+        return f"Flip: {'увімк' if flip else 'вимк'} | Mirror: {'увімк' if mirror else 'вимк'} (натисніть щоб переключити)"
+
+    def update_flip_mirror_button(self, flip: bool, mirror: bool):
+        if self.btn_flip_mirror is None:
+            return
+        self.btn_flip_mirror.set_tooltip_text(self._flip_mirror_tooltip(flip, mirror))
+        label = "↔↕" if (flip and mirror) else ("↕" if flip else ("↔" if mirror else "○"))
+        self.btn_flip_mirror.set_label(label)
+
+    def _fetch_camera_config_once(self):
+        self.fetch_camera_image_config()
+        return False
+
+    def fetch_camera_image_config(self):
+        base_url = self.fc_waybeam_base_url()
+        if not base_url:
+            return
+
+        def worker():
+            try:
+                url = f"{base_url}/api/v1/config"
+                req = urllib.request.Request(url, method="GET")
+                if self.bridge_http_user or self.bridge_http_password:
+                    user = self.bridge_http_user or ""
+                    password = self.bridge_http_password or ""
+                    auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+                    req.add_header("Authorization", f"Basic {auth}")
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                data = json.loads(raw)
+                image = data.get("data", {}).get("config", {}).get("image", {})
+                flip = bool(image.get("flip", True))
+                mirror = bool(image.get("mirror", True))
+                with self.camera_image_lock:
+                    self.camera_flip = flip
+                    self.camera_mirror = mirror
+                GLib.idle_add(self.update_flip_mirror_button, flip, mirror)
+                print(f"[INFO] Camera image config: flip={flip}, mirror={mirror}", flush=True)
+            except Exception as e:
+                print(f"[WARN] fetch_camera_image_config failed: {e}", file=sys.stderr)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_flip_mirror_clicked(self, widget):
+        base_url = self.fc_waybeam_base_url()
+        if not base_url:
+            return
+
+        with self.camera_image_lock:
+            new_flip = not self.camera_flip
+            new_mirror = not self.camera_mirror
+            self.camera_flip = new_flip
+            self.camera_mirror = new_mirror
+
+        GLib.idle_add(self.update_flip_mirror_button, new_flip, new_mirror)
+
+        def worker():
+            try:
+                for key, val in [("image.flip", new_flip), ("image.mirror", new_mirror)]:
+                    key_enc = urllib.parse.quote(key, safe="")
+                    val_enc = urllib.parse.quote(str(val).lower(), safe="")
+                    url = f"{base_url}/api/v1/set?{key_enc}={val_enc}"
+                    req = urllib.request.Request(url, method="GET")
+                    if self.bridge_http_user or self.bridge_http_password:
+                        user = self.bridge_http_user or ""
+                        password = self.bridge_http_password or ""
+                        auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+                        req.add_header("Authorization", f"Basic {auth}")
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        body = resp.read().decode("utf-8", errors="ignore").strip()
+                        print(f"[INFO] SET {key}={val} <- {resp.status}: {body[:120]}", flush=True)
+            except Exception as e:
+                print(f"[WARN] flip/mirror set failed: {e}", file=sys.stderr)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def begin_waiting_for_majestic_stream(self):
         self.last_video_frame_time = 0.0
         self.waiting_for_majestic_stream = True
@@ -1999,8 +2087,8 @@ class UdpVideoWindow:
 
             self.majestic_restart_in_progress = True
 
-        host = (self.bridge_remote_host or "").strip()
-        if not host:
+        base_url = self.fc_waybeam_base_url()
+        if not base_url:
             with self.majestic_restart_lock:
                 self.majestic_restart_in_progress = False
             print("[ERROR] API restart failed: bridge_remote_host is empty", file=sys.stderr)
@@ -2012,7 +2100,7 @@ class UdpVideoWindow:
             try:
                 user = self.bridge_http_user or ""
                 password = self.bridge_http_password or ""
-                url = f"http://{host}/api/v1/restart"
+                url = f"{base_url}/api/v1/restart"
 
                 headers = {}
                 if user or password:
@@ -4829,6 +4917,7 @@ StartupWMClass={APP_ID}
                 selected_profile_id = combo_profile.get_active_id() or "default"
                 profile_data = collect_profile_from_widgets()
                 apply_runtime_profile(profile_data, selected_profile_id, save_after=True)
+                self.fetch_camera_image_config()
 
             break
 

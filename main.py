@@ -30,9 +30,9 @@ import cairo
 
 Gst.init(None)
 
-APP_VERSION = "0.1 beta"
-APP_NAME = "Принц Вандам Галицький"
-APP_ID = "knyaz-vandam-ground-station"
+APP_VERSION = "0.9 beta"
+APP_NAME = "Наземна станція. Принц Вандам Галицький"
+APP_ID = "ground-station"
 ICON_THEME_NAME = APP_ID
 
 
@@ -1271,7 +1271,7 @@ class UdpVideoWindow:
                 "mode": "rtp",
                 "decoder": "decodebin",
                 "always_on_top": True,
-                "waybeam_api_port": 80,
+                "waybeam_api_port": 4380,
                 "modes": [
                     {
                         "name": "High (2560)",
@@ -1299,7 +1299,7 @@ class UdpVideoWindow:
                             "saturation": 50,
                         },
                     },
-                                        {
+                    {
                         "name": "Low (512)",
                         "min": 1000,
                         "max": 2000,
@@ -1333,7 +1333,7 @@ class UdpVideoWindow:
                 "aux_col": 0,
             },
             "zoom": {
-                "aux_channel": -1,
+                "aux_channel": 8,
                 "size_api_port": 8765,
                 "modes": [
                     {

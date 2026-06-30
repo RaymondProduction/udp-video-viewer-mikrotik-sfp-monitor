@@ -31,7 +31,7 @@ import cairo
 Gst.init(None)
 
 APP_VERSION = "0.9 beta"
-APP_NAME = "Наземна станція. Принц Вандам Галицький"
+APP_NAME = "Наземна станція"
 APP_ID = "ground-station"
 ICON_THEME_NAME = APP_ID
 
@@ -90,14 +90,14 @@ SETTINGS_FILE = SETTINGS_DIR / "ground_station_settings.json"
 
 PLACEHOLDER_IMAGE_FILE = first_existing_path(
     [
-        resource_path("vandam.png"),
-        resource_path("vandam.jpg"),
-        resource_path("vandam.jpeg"),
-        resource_path("80dshv.png"),
-        Path(__file__).resolve().parent / "vandam.png",
-        Path(__file__).resolve().parent / "vandam.jpg",
-        Path(__file__).resolve().parent / "vandam.jpeg",
-        Path(__file__).resolve().parent / "80dshv.png",
+        resource_path("placeholder.png"),
+        resource_path("placeholder.jpg"),
+        resource_path("placeholder.jpeg"),
+        resource_path("placeholder.png"),
+        Path(__file__).resolve().parent / "placeholder.png",
+        Path(__file__).resolve().parent / "placeholder.jpg",
+        Path(__file__).resolve().parent / "placeholder.jpeg",
+        Path(__file__).resolve().parent / "placeholder.png",
     ]
 )
 
@@ -3476,11 +3476,11 @@ class UdpVideoWindow:
 
     def find_icon_source(self) -> Optional[Path]:
         candidates = [
-            resource_path("prince_ground_station.png"),
+            resource_path("icon.png"),
             resource_path("prince.png"),
             resource_path("icon.png"),
             resource_path("app.png"),
-            Path(__file__).resolve().parent / "prince_ground_station.png",
+            Path(__file__).resolve().parent / "icon.png",
             Path(__file__).resolve().parent / "prince.png",
             Path(__file__).resolve().parent / "icon.png",
             Path(__file__).resolve().parent / "app.png",

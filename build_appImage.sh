@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="prince_ground_station"
-APP_TITLE="Prince Ground Station"
+APP_NAME="ground_station"
+APP_TITLE="Ground Station"
 ENTRY_SCRIPT="main.py"
-ICON_FILE="prince_ground_station.png"
-PLACEHOLDER_FILE="vandam.png"
-FALLBACK_PLACEHOLDER="80dshv.png"
+ICON_FILE="icon.png"
+PLACEHOLDER_FILE="placeholder.png"
+FALLBACK_PLACEHOLDER="placeholder.png"
 FONT_FILE="font_btfl_hd.png"
 DESKTOP_FILE="${APP_NAME}.desktop"
 APPDIR="AppDir"
@@ -74,11 +74,11 @@ mkdir -p "$APPDIR/usr/bin"
 cp -r "dist/$APP_NAME/"* "$APPDIR/usr/bin/"
 
 echo "==> Writing AppRun..."
-cat > "$APPDIR/AppRun" <<'EOF'
+cat > "$APPDIR/AppRun" <<EOF
 #!/bin/sh
-HERE="$(dirname "$(readlink -f "$0")")"
-export PATH="$HERE/usr/bin:$PATH"
-exec "$HERE/usr/bin/prince_ground_station" "$@"
+HERE="\$(dirname "\$(readlink -f "\$0")")"
+export PATH="\$HERE/usr/bin:\$PATH"
+exec "\$HERE/usr/bin/${APP_NAME}" "\$@"
 EOF
 chmod +x "$APPDIR/AppRun"
 

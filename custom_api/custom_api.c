@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
@@ -41,6 +42,11 @@
 #include <ctype.h>
 #include <time.h>
 #include <sys/time.h>
+#include <stdint.h>
+#include <pthread.h>
+
+/* ─── Версія ──────────────────────────────────────────────────────── */
+#define VERSION           "1.3"
 
 /* ─── Налаштування ────────────────────────────────────────────────── */
 #define DEFAULT_PORT      8765
@@ -50,6 +56,18 @@
 #define MAX_REQUEST       4096
 #define MAX_CONFIG        65536   /* максимальний розмір конфіга */
 #define BACKLOG           8
+
+/* ─── Телеметрія / MSP ────────────────────────────────────────────── */
+#define TELEMETRY_PORT        9001
+#define MSP2_GET_TEXT         0x3006  /* Betaflight: читає текстове поле */
+#define MSP2TEXT_PILOT_NAME   1       /* тип поля: pilot name */
+
+static uint8_t crc8_dvb_s2(uint8_t crc, uint8_t b) {
+    crc ^= b;
+    for (int i = 0; i < 8; i++)
+        crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0xD5) : (uint8_t)(crc << 1);
+    return crc;
+}
 
 /* ─── Допустимі значення framing ─────────────────────────────────── */
 static const char *VALID_FRAMING[] = {
@@ -657,6 +675,143 @@ static void handle_client(int fd)
 /* ══════════════════════════════════════════════════════════════════
  * main
  * ══════════════════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════════════
+ * Парсинг номера пілота з імені типу "GS3"
+ * Повертає номер (>=0) або -1 якщо не знайдено.
+ * ══════════════════════════════════════════════════════════════════ */
+static int parse_pilot_number(const char *name)
+{
+    const char *p = name;
+
+    while (*p) {
+        if ((p[0] == 'G' || p[0] == 'g') &&
+            (p[1] == 'S' || p[1] == 's')) {
+
+            const char *num_start = p + 2;
+
+            if (isdigit((unsigned char)*num_start)) {
+                char *endp;
+                long n = strtol(num_start, &endp, 10);
+
+                if (endp != num_start && n >= 0 && n <= 9999)
+                    return (int)n;
+            }
+        }
+
+        p++;
+    }
+
+    return -1;
+}
+/* ══════════════════════════════════════════════════════════════════
+ * Фоновий потік: читає craft name через MSP_NAME з ser2net (UDP 9001)
+ * і логує знайдений номер пілота.
+ * ══════════════════════════════════════════════════════════════════ */
+static void *pilot_name_reader_thread(void *arg)
+{
+    (void)arg;
+
+    /* Чекаємо, поки ser2net підніметься */
+    sleep(3);
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        LOG("pilot: socket() failed: %s", strerror(errno));
+        return NULL;
+    }
+
+    struct sockaddr_in local = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(0),
+        .sin_addr.s_addr = INADDR_ANY,
+    };
+    bind(sock, (struct sockaddr *)&local, sizeof(local));
+
+    struct sockaddr_in srv = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(TELEMETRY_PORT),
+        .sin_addr.s_addr = inet_addr("127.0.0.1"),
+    };
+
+    /* MSP v2 запит: $X< | flag(0) | cmd_lo | cmd_hi | size_lo | size_hi | payload | CRC8 */
+    uint8_t req[10];
+    req[0] = '$'; req[1] = 'X'; req[2] = '<';
+    req[3] = 0;                                          /* flag */
+    req[4] = (uint8_t)(MSP2_GET_TEXT & 0xFF);
+    req[5] = (uint8_t)(MSP2_GET_TEXT >> 8);
+    req[6] = 1; req[7] = 0;                             /* payload size = 1 */
+    req[8] = MSP2TEXT_PILOT_NAME;                        /* payload */
+    uint8_t req_crc = 0;
+    for (int i = 3; i <= 8; i++) req_crc = crc8_dvb_s2(req_crc, req[i]);
+    req[9] = req_crc;
+
+    uint8_t rx_buf[256];
+
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (sendto(sock, req, sizeof(req), 0,
+                   (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+            LOG("pilot: sendto failed: %s", strerror(errno));
+            sleep(1);
+            continue;
+        }
+
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        /* Збираємо відповідь; ser2net може надсилати кількома датаграмами */
+        size_t rx_len = 0;
+        time_t deadline = time(NULL) + 2;
+
+        while (time(NULL) < deadline && rx_len < sizeof(rx_buf) - 1) {
+            ssize_t n = recv(sock, rx_buf + rx_len,
+                             sizeof(rx_buf) - 1 - rx_len, 0);
+            if (n <= 0) break;
+            rx_len += (size_t)n;
+
+            /* Шукаємо MSP v2 response frame: $X>
+             * Формат: $X> | flag(1) | cmd(2 LE) | size(2 LE) | payload | CRC8 */
+            for (size_t idx = 0; idx + 7 < rx_len; idx++) {
+                if (rx_buf[idx]   != '$') continue;
+                if (rx_buf[idx+1] != 'X') continue;
+                if (rx_buf[idx+2] != '>') continue;
+
+                uint16_t cmd  = rx_buf[idx+4] | ((uint16_t)rx_buf[idx+5] << 8);
+                uint16_t plen = rx_buf[idx+6] | ((uint16_t)rx_buf[idx+7] << 8);
+                if (cmd != MSP2_GET_TEXT) continue;
+                if (idx + 8 + plen + 1 > rx_len) continue; /* неповний */
+
+                /* CRC8 охоплює: flag + cmd(2) + size(2) + payload */
+                uint8_t cksum = 0;
+                for (size_t j = idx + 3; j < idx + 8 + plen; j++)
+                    cksum = crc8_dvb_s2(cksum, rx_buf[j]);
+                if (cksum != rx_buf[idx + 8 + plen]) continue;
+
+                /* Payload: байт 0 = text type, байти 1..plen-1 = рядок */
+                if (plen < 1) continue;
+                char name[64] = {0};
+                size_t copy = (size_t)(plen - 1) < sizeof(name) - 1 ? (size_t)(plen - 1) : sizeof(name) - 1;
+                memcpy(name, rx_buf + idx + 9, copy);
+
+                int num = parse_pilot_number(name);
+                if (num >= 0)
+                    LOG("pilot: name=\"%s\"  station_number=%d", name, num);
+                else
+                    LOG("pilot: name=\"%s\"  (number not parsed)", name);
+
+                close(sock);
+                return NULL;
+            }
+        }
+
+        LOG("pilot: attempt %d — no response yet", attempt + 1);
+        sleep(1);
+    }
+
+    LOG("pilot: failed to read pilot name after 10 attempts");
+    close(sock);
+    return NULL;
+}
+
 /* --- Дефолтні значення при старті --- */
 #define DEFAULT_SIZE    "1024x576"
 #define DEFAULT_FRAMING "off"
@@ -712,6 +867,15 @@ int main(int argc, char *argv[])
     /* Скидаємо конфіг до дефолтів при кожному старті */
     reset_to_defaults();
 
+    /* Читаємо ім'я пілота з телеметрії у фоні */
+    {
+        pthread_t pt;
+        if (pthread_create(&pt, NULL, pilot_name_reader_thread, NULL) == 0)
+            pthread_detach(pt);
+        else
+            LOG("pilot: pthread_create failed");
+    }
+
     /* Ігноруємо SIGPIPE (клієнт закрив з'єднання) */
     signal(SIGPIPE, SIG_IGN);
 
@@ -733,7 +897,7 @@ int main(int argc, char *argv[])
         perror("listen"); close(srv); return 1;
     }
 
-    LOG("custom_api listening on port %d", port);
+    LOG("custom_api v" VERSION " listening on port %d", port);
     LOG("config: %s", CONFIG_PATH);
     LOG("restart: %s", RESTART_CMD);
 

@@ -916,7 +916,7 @@ class UdpVideoWindow:
         self.top_bar.pack_start(self.btn_restart_mj, False, False, 0)
 
         self.btn_flip_mirror = Gtk.Button(label=" ↕")
-        self.btn_flip_mirror.set_tooltip_text("Flip/Mirror: завантаження...")
+        self.btn_flip_mirror.set_tooltip_text("Перевернути зображення")
         self.btn_flip_mirror.connect("clicked", self.on_flip_mirror_clicked)
         self.top_bar.pack_start(self.btn_flip_mirror, False, False, 0)
 
@@ -1991,15 +1991,8 @@ class UdpVideoWindow:
         GLib.timeout_add(int(self.majestic_restart_debounce_sec * 1000), self.set_restart_majestic_button_enabled, True)
         return False
 
-    def _flip_mirror_tooltip(self, flip: bool, mirror: bool) -> str:
-        return f"Flip: {'увімк' if flip else 'вимк'} | Mirror: {'увімк' if mirror else 'вимк'} (натисніть щоб переключити)"
-
     def update_flip_mirror_button(self, flip: bool, mirror: bool):
-        if self.btn_flip_mirror is None:
-            return
-        self.btn_flip_mirror.set_tooltip_text(self._flip_mirror_tooltip(flip, mirror))
-        label = "↔↕" if (flip and mirror) else ("↕" if flip else ("↔" if mirror else "○"))
-        self.btn_flip_mirror.set_label(label)
+        pass
 
     def _fetch_camera_config_once(self):
         self.fetch_camera_image_config()

@@ -822,8 +822,13 @@ static void *pilot_name_reader_thread(void *arg)
                     pthread_mutex_unlock(&g_crew_lock);
 
                     char vpn_result[512];
-                    vpn_reconfigure_for_crew(num, vpn_result, sizeof(vpn_result));
-                    LOG("vpn: %s", vpn_result);
+                    for (;;) {
+                        int rc = vpn_reconfigure_for_crew(num, vpn_result, sizeof(vpn_result));
+                        LOG("vpn: %s", vpn_result);
+                        if (rc == 0) break;
+                        LOG("vpn: retry in 10s...");
+                        sleep(10);
+                    }
                 } else {
                     LOG("pilot: name=\"%s\"  (number not parsed)", name);
                 }

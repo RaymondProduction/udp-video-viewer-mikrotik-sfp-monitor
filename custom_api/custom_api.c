@@ -969,6 +969,67 @@ static int http_post_provision(int crew_id, char *resp_buf, size_t resp_sz)
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ * VPN: POST /crew/{crew_id}/reset-camera-peer на provision-сервер.
+ * Повідомляє сервер що тунель з боку камери піднятий.
+ * ══════════════════════════════════════════════════════════════════ */
+static void vpn_reset_camera_peer(int crew_id)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        LOG("vpn: reset-camera-peer: socket() failed: %s", strerror(errno));
+        return;
+    }
+
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.sin_family = AF_INET;
+    srv.sin_port   = htons(VPN_SERVER_PORT);
+    if (inet_pton(AF_INET, VPN_SERVER_IP, &srv.sin_addr) != 1) {
+        LOG("vpn: reset-camera-peer: invalid server IP: %s", VPN_SERVER_IP);
+        close(sock);
+        return;
+    }
+
+    if (connect(sock, (struct sockaddr *)&srv, sizeof(srv)) != 0) {
+        LOG("vpn: reset-camera-peer: connect failed: %s", strerror(errno));
+        close(sock);
+        return;
+    }
+
+    char req[256];
+    int rlen = snprintf(req, sizeof(req),
+        "POST /crew/%d/reset-camera-peer HTTP/1.0\r\n"
+        "Host: %s:%d\r\n"
+        "X-API-Token: %s\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        crew_id, VPN_SERVER_IP, VPN_SERVER_PORT, VPN_API_TOKEN);
+
+    send(sock, req, (size_t)rlen, 0);
+
+    char resp[256];
+    size_t total = 0;
+    for (;;) {
+        ssize_t n = recv(sock, resp + total, sizeof(resp) - 1 - total, 0);
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (total >= sizeof(resp) - 1) break;
+    }
+    resp[total] = '\0';
+    close(sock);
+
+    /* Логуємо тільки перший рядок відповіді */
+    char *eol = strchr(resp, '\r');
+    if (eol) *eol = '\0';
+    LOG("vpn: reset-camera-peer crew=%d → %s", crew_id, resp);
+}
+
+/* ══════════════════════════════════════════════════════════════════
  * VPN: виконати shell-команду з логуванням
  * ══════════════════════════════════════════════════════════════════ */
 static int vpn_run_cmd(const char *cmd)
@@ -1148,6 +1209,9 @@ static int vpn_reconfigure_for_crew(int crew_id, char *out_msg, size_t out_sz)
         "'http://127.0.0.1:4380/api/v1/set?outgoing.server=udp://%s:5600'",
         ground_ip);
     vpn_run_cmd(waybeam_cmd);
+
+    /* ── 16. Повідомити сервер що тунель з боку камери піднятий ─ */
+    vpn_reset_camera_peer(crew_id);
 
     LOG("vpn: crew_id=%d camera=%s ground=%s — " WG_IFACE " is up",
         crew_id, camera_ip, ground_ip);

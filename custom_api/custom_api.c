@@ -46,7 +46,7 @@
 #include <pthread.h>
 
 /* ─── Версія ──────────────────────────────────────────────────────── */
-#define VERSION           "1.3"
+#define VERSION           "1.4wg"
 
 /* ─── Налаштування ────────────────────────────────────────────────── */
 #define DEFAULT_PORT      8765
@@ -56,6 +56,22 @@
 #define MAX_REQUEST       4096
 #define MAX_CONFIG        65536   /* максимальний розмір конфіга */
 #define BACKLOG           8
+
+/* ─── VPN Provisioning ─────────────────────────────────────────────── */
+/* Можна перевизначити через Makefile: -DVPN_SERVER_IP='"x.x.x.x"'    */
+#ifndef VPN_SERVER_IP
+# define VPN_SERVER_IP   "176.108.4.228"
+#endif
+#ifndef VPN_SERVER_PORT
+# define VPN_SERVER_PORT  49152
+#endif
+#ifndef VPN_API_TOKEN
+# define VPN_API_TOKEN   "0284"
+#endif
+#define WG_CONF_PATH     "/etc/wireguard/wg0.conf"
+#define WG_CONF_TMP      "/etc/wireguard/wg0.conf.tmp"
+#define WG_IFACE         "wg0"
+#define VPN_RESP_MAX     8192
 
 /* ─── Телеметрія / MSP ────────────────────────────────────────────── */
 #define TELEMETRY_PORT        9001
@@ -68,6 +84,10 @@ static uint8_t crc8_dvb_s2(uint8_t crc, uint8_t b) {
         crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0xD5) : (uint8_t)(crc << 1);
     return crc;
 }
+
+/* ─── Глобальний стан: номер екіпажу (заповнюється з телеметрії) ─── */
+static int             g_crew_id   = -1;
+static pthread_mutex_t g_crew_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ─── Допустимі значення framing ─────────────────────────────────── */
 static const char *VALID_FRAMING[] = {
@@ -646,18 +666,17 @@ static void handle_client(int fd)
         return;
     }
 
-    /* Тільки GET */
-    if (strcmp(method, "GET") != 0) {
-        send_response(fd, 405, "Method Not Allowed",
-            "{\"ok\":false,\"error\":\"only GET is supported\"}");
-        return;
-    }
-
     /* Розбиваємо path на шлях та query string */
     char *qs = strchr(path, '?');
     if (qs) { *qs = '\0'; qs++; } else { qs = ""; }
 
     LOG("< %s %s%s%s", method, path, *qs ? "?" : "", qs);
+
+    if (strcmp(method, "GET") != 0) {
+        send_response(fd, 405, "Method Not Allowed",
+            "{\"ok\":false,\"error\":\"only GET is supported\"}");
+        return;
+    }
 
     if (strcmp(path, "/set") == 0) {
         handle_set(fd, qs);
@@ -703,6 +722,9 @@ static int parse_pilot_number(const char *name)
 
     return -1;
 }
+/* Forward declaration (vpn функції визначені нижче) */
+static int vpn_reconfigure_for_crew(int crew_id, char *out_msg, size_t out_sz);
+
 /* ══════════════════════════════════════════════════════════════════
  * Фоновий потік: читає craft name через MSP_NAME з ser2net (UDP 9001)
  * і логує знайдений номер пілота.
@@ -793,10 +815,18 @@ static void *pilot_name_reader_thread(void *arg)
                 memcpy(name, rx_buf + idx + 9, copy);
 
                 int num = parse_pilot_number(name);
-                if (num >= 0)
+                if (num >= 0) {
                     LOG("pilot: name=\"%s\"  station_number=%d", name, num);
-                else
+                    pthread_mutex_lock(&g_crew_lock);
+                    g_crew_id = num;
+                    pthread_mutex_unlock(&g_crew_lock);
+
+                    char vpn_result[512];
+                    vpn_reconfigure_for_crew(num, vpn_result, sizeof(vpn_result));
+                    LOG("vpn: %s", vpn_result);
+                } else {
                     LOG("pilot: name=\"%s\"  (number not parsed)", name);
+                }
 
                 close(sock);
                 return NULL;
@@ -810,6 +840,296 @@ static void *pilot_name_reader_thread(void *arg)
     LOG("pilot: failed to read pilot name after 10 attempts");
     close(sock);
     return NULL;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * VPN: розекранування JSON-рядка (\n → newline, \\ → \, \" → ")
+ * ══════════════════════════════════════════════════════════════════ */
+static void json_unescape(const char *src, char *dst, size_t dst_sz)
+{
+    size_t i = 0;
+    while (*src && i + 1 < dst_sz) {
+        if (*src == '\\' && src[1]) {
+            src++;
+            switch (*src) {
+                case 'n':  dst[i++] = '\n'; break;
+                case 'r':  dst[i++] = '\r'; break;
+                case 't':  dst[i++] = '\t'; break;
+                case '\\': dst[i++] = '\\'; break;
+                case '"':  dst[i++] = '"';  break;
+                default:   dst[i++] = *src; break;
+            }
+            src++;
+        } else {
+            dst[i++] = *src++;
+        }
+    }
+    dst[i] = '\0';
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * VPN: відфільтрувати рядки Address та MTU з WireGuard-конфігу.
+ * wg setconf не розуміє ці поля — вони потрібні тільки для wg-quick.
+ * ══════════════════════════════════════════════════════════════════ */
+static void wg_filter_config(const char *src, char *dst, size_t dst_sz)
+{
+    size_t out = 0;
+    const char *line = src;
+
+    while (*line && out < dst_sz - 1) {
+        const char *eol = strchr(line, '\n');
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+
+        int skip = (strncmp(line, "Address", 7) == 0 ||
+                    strncmp(line, "MTU",     3) == 0);
+
+        if (!skip && out + line_len + 1 < dst_sz) {
+            memcpy(dst + out, line, line_len);
+            out += line_len;
+            dst[out++] = '\n';
+        }
+
+        if (!eol) break;
+        line = eol + 1;
+    }
+    dst[out] = '\0';
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * VPN: HTTP POST /provision → заповнює resp_buf, повертає довжину
+ * або -1 при помилці з'єднання.
+ * Використовує HTTP/1.0 з Connection: close — без chunked encoding.
+ * ══════════════════════════════════════════════════════════════════ */
+static int http_post_provision(int crew_id, char *resp_buf, size_t resp_sz)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        LOG("vpn: socket() failed: %s", strerror(errno));
+        return -1;
+    }
+
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.sin_family = AF_INET;
+    srv.sin_port   = htons(VPN_SERVER_PORT);
+    if (inet_pton(AF_INET, VPN_SERVER_IP, &srv.sin_addr) != 1) {
+        LOG("vpn: invalid server IP: %s", VPN_SERVER_IP);
+        close(sock);
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr *)&srv, sizeof(srv)) != 0) {
+        LOG("vpn: connect %s:%d failed: %s",
+            VPN_SERVER_IP, VPN_SERVER_PORT, strerror(errno));
+        close(sock);
+        return -1;
+    }
+
+    char body[128];
+    int blen = snprintf(body, sizeof(body),
+        "{\"crew_id\":%d,\"role\":\"camera\"}", crew_id);
+
+    char req[512];
+    int rlen = snprintf(req, sizeof(req),
+        "POST /provision HTTP/1.0\r\n"
+        "Host: %s:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "X-API-Token: %s\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        VPN_SERVER_IP, VPN_SERVER_PORT, blen, VPN_API_TOKEN, body);
+
+    if (send(sock, req, (size_t)rlen, 0) < rlen) {
+        LOG("vpn: send() failed: %s", strerror(errno));
+        close(sock);
+        return -1;
+    }
+
+    size_t total = 0;
+    for (;;) {
+        ssize_t n = recv(sock, resp_buf + total, resp_sz - 1 - total, 0);
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (total >= resp_sz - 1) break;
+    }
+    resp_buf[total] = '\0';
+    close(sock);
+    return (int)total;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * VPN: виконати shell-команду з логуванням
+ * ══════════════════════════════════════════════════════════════════ */
+static int vpn_run_cmd(const char *cmd)
+{
+    LOG("vpn: run: %s", cmd);
+    int rc = system(cmd);
+    if (rc != 0)
+        LOG("vpn: cmd rc=%d: %s", rc, cmd);
+    return rc;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * VPN: основна функція налаштування тунелю для конкретного crew_id.
+ * out_msg отримує JSON-результат.
+ * Повертає 0 при успіху, -1 при помилці.
+ * ══════════════════════════════════════════════════════════════════ */
+static int vpn_reconfigure_for_crew(int crew_id, char *out_msg, size_t out_sz)
+{
+    LOG("vpn: provisioning for crew_id=%d via %s:%d",
+        crew_id, VPN_SERVER_IP, VPN_SERVER_PORT);
+
+    /* ── 1. HTTP POST /provision ─────────────────────────────── */
+    char *http_buf = malloc(VPN_RESP_MAX);
+    if (!http_buf) {
+        snprintf(out_msg, out_sz, "{\"ok\":false,\"error\":\"out of memory\"}");
+        return -1;
+    }
+
+    int http_len = http_post_provision(crew_id, http_buf, VPN_RESP_MAX);
+    if (http_len <= 0) {
+        free(http_buf);
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"cannot connect to provision server %s:%d\"}",
+            VPN_SERVER_IP, VPN_SERVER_PORT);
+        return -1;
+    }
+
+    /* ── 2. Знайти JSON-тіло після HTTP-заголовків ───────────── */
+    const char *json_body = strstr(http_buf, "\r\n\r\n");
+    if (!json_body) {
+        free(http_buf);
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"malformed HTTP response from provision server\"}");
+        return -1;
+    }
+    json_body += 4;
+
+    /* ── 3. Перевірити ok: true ──────────────────────────────── */
+    if (json_get_bool_field(json_body, "ok") != 1) {
+        char srv_err[256] = "server returned ok:false";
+        json_get_string_field(json_body, "error", srv_err, sizeof(srv_err));
+        free(http_buf);
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"provision server: %s\"}", srv_err);
+        return -1;
+    }
+
+    /* ── 4. Витягти поля відповіді ───────────────────────────── */
+    char camera_ip[64]    = {0};
+    char network[64]      = {0};
+    char config_raw[4096] = {0};
+
+    if (!json_get_string_field(json_body, "camera_ip", camera_ip, sizeof(camera_ip))) {
+        free(http_buf);
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"no camera_ip in provision response\"}");
+        return -1;
+    }
+    if (!json_get_string_field(json_body, "config", config_raw, sizeof(config_raw))) {
+        free(http_buf);
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"no config in provision response\"}");
+        return -1;
+    }
+    json_get_string_field(json_body, "network", network, sizeof(network));
+    free(http_buf);
+
+    /* ── 5. Витягти довжину префікса з network (наприклад /24) ─ */
+    char prefix[8] = "24";
+    char *slash = strchr(network, '/');
+    if (slash && isdigit((unsigned char)slash[1]))
+        snprintf(prefix, sizeof(prefix), "%s", slash + 1);
+
+    /* ── 6. Базова валідація щоб уникнути command injection ──── */
+    for (const char *p = camera_ip; *p; p++) {
+        if (!isdigit((unsigned char)*p) && *p != '.') {
+            snprintf(out_msg, out_sz,
+                "{\"ok\":false,\"error\":\"invalid camera_ip format: %s\"}", camera_ip);
+            return -1;
+        }
+    }
+    for (const char *p = prefix; *p; p++) {
+        if (!isdigit((unsigned char)*p)) {
+            snprintf(out_msg, out_sz,
+                "{\"ok\":false,\"error\":\"invalid network prefix: %s\"}", prefix);
+            return -1;
+        }
+    }
+
+    /* ── 7. Розекранувати JSON-рядок → реальні символи ──────── */
+    char config_unesc[4096] = {0};
+    json_unescape(config_raw, config_unesc, sizeof(config_unesc));
+
+    /* ── 8. Відфільтрувати Address та MTU (wg setconf їх не знає) */
+    char wg_conf[4096] = {0};
+    wg_filter_config(config_unesc, wg_conf, sizeof(wg_conf));
+
+    /* ── 9. Записати конфіг ──────────────────────────────────── */
+    vpn_run_cmd("mkdir -p /etc/wireguard");
+    if (write_file_atomic(WG_CONF_PATH, WG_CONF_TMP,
+                          wg_conf, strlen(wg_conf)) != 0) {
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"cannot write %s: %s\"}",
+            WG_CONF_PATH, strerror(errno));
+        return -1;
+    }
+    LOG("vpn: wrote %s", WG_CONF_PATH);
+
+    /* ── 10. Зупинити старий wg0 (ігнорувати помилки — може не існувати) */
+    vpn_run_cmd("ip link set " WG_IFACE " down 2>/dev/null || true");
+    vpn_run_cmd("ip link del "  WG_IFACE " 2>/dev/null || true");
+
+    /* ── 11. Створити новий інтерфейс ───────────────────────── */
+    if (vpn_run_cmd("ip link add dev " WG_IFACE " type wireguard") != 0) {
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"ip link add dev " WG_IFACE " type wireguard failed\"}");
+        return -1;
+    }
+    if (vpn_run_cmd("wg setconf " WG_IFACE " " WG_CONF_PATH) != 0) {
+        vpn_run_cmd("ip link del " WG_IFACE " 2>/dev/null || true");
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"wg setconf " WG_IFACE " failed\"}");
+        return -1;
+    }
+
+    /* ── 12. Призначити IP-адресу ────────────────────────────── */
+    char ip_cmd[128];
+    snprintf(ip_cmd, sizeof(ip_cmd),
+        "ip address add %s/%s dev " WG_IFACE, camera_ip, prefix);
+    if (vpn_run_cmd(ip_cmd) != 0) {
+        vpn_run_cmd("ip link del " WG_IFACE " 2>/dev/null || true");
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"ip address add %s/%s dev " WG_IFACE " failed\"}",
+            camera_ip, prefix);
+        return -1;
+    }
+
+    /* ── 13. Підняти інтерфейс ───────────────────────────────── */
+    if (vpn_run_cmd("ip link set up dev " WG_IFACE) != 0) {
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"ip link set up dev " WG_IFACE " failed\"}");
+        return -1;
+    }
+
+    /* ── 14. Лог стану ───────────────────────────────────────── */
+    vpn_run_cmd("wg show " WG_IFACE);
+    vpn_run_cmd("ip addr show " WG_IFACE);
+
+    LOG("vpn: crew_id=%d camera_ip=%s/%s — " WG_IFACE " is up",
+        crew_id, camera_ip, prefix);
+
+    snprintf(out_msg, out_sz,
+        "{\"ok\":true,\"crew_id\":%d,\"camera_ip\":\"%s\","
+        "\"iface\":\"" WG_IFACE "\"}",
+        crew_id, camera_ip);
+    return 0;
 }
 
 /* --- Дефолтні значення при старті --- */

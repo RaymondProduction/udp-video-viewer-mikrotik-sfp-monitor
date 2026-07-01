@@ -35,6 +35,11 @@ APP_NAME = "Наземна станція"
 APP_ID = "ground-station"
 ICON_THEME_NAME = APP_ID
 
+VPN_SERVER_URL = "http://176.108.4.228:49152"
+VPN_API_TOKEN = "0284"
+VPN_WG_IFACE = "wg0"
+VPN_ROLE = "ground"
+
 
 def get_default_majestic_user() -> str:
     return "".join(chr(x) for x in (114, 111, 111, 116))
@@ -914,6 +919,11 @@ class UdpVideoWindow:
         self.btn_flip_mirror.set_tooltip_text("Flip/Mirror: завантаження...")
         self.btn_flip_mirror.connect("clicked", self.on_flip_mirror_clicked)
         self.top_bar.pack_start(self.btn_flip_mirror, False, False, 0)
+
+        self.btn_crew_vpn = Gtk.Button(label="VPN")
+        self.btn_crew_vpn.set_tooltip_text("Підключитися до камери екіпажу через WireGuard VPN")
+        self.btn_crew_vpn.connect("clicked", self.on_connect_crew_clicked)
+        self.top_bar.pack_start(self.btn_crew_vpn, False, False, 0)
 
         btn_settings = Gtk.Button()
         btn_settings.set_image(Gtk.Image.new_from_icon_name("emblem-system-symbolic", Gtk.IconSize.BUTTON))
@@ -4923,6 +4933,213 @@ StartupWMClass={APP_ID}
 
         GLib.source_remove(timer_id)
         dialog.destroy()
+
+    def on_connect_crew_clicked(self, widget):
+        dialog = Gtk.Dialog(
+            title="Підключення до камери екіпажу",
+            transient_for=self.window,
+            flags=0,
+        )
+        dialog.set_default_size(400, -1)
+
+        content = dialog.get_content_area()
+        content.set_spacing(0)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_border_width(16)
+        content.pack_start(box, True, True, 0)
+
+        title_label = Gtk.Label()
+        title_label.set_markup("<b>Підключення до камери</b>")
+        title_label.set_xalign(0.0)
+        box.pack_start(title_label, False, False, 0)
+
+        desc_label = Gtk.Label(
+            label="Введіть номер екіпажу. Програма автоматично отримає конфігурацію "
+                  "WireGuard та налаштує VPN-тунель і IP-адреси камери."
+        )
+        desc_label.set_xalign(0.0)
+        desc_label.set_line_wrap(True)
+        desc_label.set_max_width_chars(50)
+        box.pack_start(desc_label, False, False, 0)
+
+        crew_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        crew_label = Gtk.Label(label="Номер екіпажу:")
+        crew_label.set_xalign(0.0)
+        crew_label.set_width_chars(16)
+        crew_box.pack_start(crew_label, False, False, 0)
+
+        spin_crew = Gtk.SpinButton()
+        spin_crew.set_range(1, 9999)
+        spin_crew.set_increments(1, 10)
+        spin_crew.set_value(1)
+        spin_crew.set_hexpand(True)
+        crew_box.pack_start(spin_crew, True, True, 0)
+        box.pack_start(crew_box, False, False, 0)
+
+        status_label = Gtk.Label(label="")
+        status_label.set_xalign(0.0)
+        status_label.set_line_wrap(True)
+        status_label.set_max_width_chars(50)
+        box.pack_start(status_label, False, False, 0)
+
+        btn_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_bar.set_halign(Gtk.Align.END)
+        btn_cancel = Gtk.Button(label="Скасувати")
+        btn_connect = Gtk.Button(label="Підключити")
+        btn_connect.get_style_context().add_class("suggested-action")
+        btn_bar.pack_start(btn_cancel, False, False, 0)
+        btn_bar.pack_start(btn_connect, False, False, 0)
+        box.pack_start(btn_bar, False, False, 0)
+
+        def on_connect_btn(*_):
+            crew_id = spin_crew.get_value_as_int()
+            btn_connect.set_sensitive(False)
+            btn_cancel.set_sensitive(False)
+            spin_crew.set_sensitive(False)
+            status_label.set_markup(f"<i>[1/3] Запит конфігурації VPN для екіпажу #{crew_id}...</i>")
+
+            def status_cb(msg):
+                GLib.idle_add(status_label.set_markup, f"<i>{msg}</i>")
+
+            def run_setup():
+                error, camera_ip = self._provision_crew_vpn(crew_id, status_cb)
+
+                def on_done():
+                    if error:
+                        status_label.set_markup(f'<span foreground="red"><b>Помилка:</b> {GLib.markup_escape_text(error)}</span>')
+                        btn_connect.set_sensitive(True)
+                        btn_cancel.set_sensitive(True)
+                        spin_crew.set_sensitive(True)
+                    else:
+                        escaped_ip = GLib.markup_escape_text(str(camera_ip))
+                        status_label.set_markup(
+                            f'<span foreground="green"><b>VPN підключено!</b> IP камери: {escaped_ip}</span>'
+                        )
+                        self._apply_vpn_camera_ip(camera_ip)
+                        GLib.timeout_add(1800, lambda: dialog.response(Gtk.ResponseType.OK) or False)
+
+                GLib.idle_add(on_done)
+
+            threading.Thread(target=run_setup, daemon=True).start()
+
+        btn_connect.connect("clicked", on_connect_btn)
+        btn_cancel.connect("clicked", lambda *_: dialog.response(Gtk.ResponseType.CANCEL))
+
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
+    def _provision_crew_vpn(self, crew_id: int, status_cb) -> tuple:
+        """Provisions WireGuard VPN for crew_id. Returns (error_str_or_None, camera_ip_or_None)."""
+        import tempfile
+
+        status_cb(f"[1/3] Запит конфігурації VPN для екіпажу #{crew_id}...")
+        try:
+            req_data = json.dumps({"crew_id": crew_id, "role": VPN_ROLE}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{VPN_SERVER_URL}/provision",
+                data=req_data,
+                headers={
+                    "X-API-Token": VPN_API_TOKEN,
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+                response_data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            return f"Не вдалося отримати конфігурацію: {e}", None
+
+        if not response_data.get("ok"):
+            msg = response_data.get("error") or "невідома помилка"
+            return f"Сервер відхилив запит: {msg}", None
+
+        wg_config = response_data.get("config")
+        camera_ip = response_data.get("camera_ip")
+        if not wg_config:
+            return "Сервер не повернув конфігурацію WireGuard", None
+        if not camera_ip:
+            return "Сервер не повернув IP камери", None
+
+        status_cb(f"[2/3] Запис конфігурації WireGuard...")
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".conf", delete=False, prefix="/tmp/wg_crew_"
+            ) as tmp_conf:
+                tmp_conf.write(wg_config)
+                if not wg_config.endswith("\n"):
+                    tmp_conf.write("\n")
+                tmp_conf_path = tmp_conf.name
+        except Exception as e:
+            return f"Не вдалося записати конфігурацію: {e}", None
+
+        wg_name = VPN_WG_IFACE
+        shell_script = (
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "mkdir -p /etc/wireguard\n"
+            f"cp -- '{tmp_conf_path}' /etc/wireguard/{wg_name}.conf\n"
+            f"chmod 600 /etc/wireguard/{wg_name}.conf\n"
+            f"wg-quick down {wg_name} 2>/dev/null || true\n"
+            f"wg-quick up {wg_name}\n"
+            f"systemctl enable 'wg-quick@{wg_name}' >/dev/null 2>&1 || true\n"
+            f"rm -f -- '{tmp_conf_path}'\n"
+        )
+
+        tmp_script_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".sh", delete=False, prefix="/tmp/wg_setup_"
+            ) as tmp_script:
+                tmp_script.write(shell_script)
+                tmp_script_path = tmp_script.name
+            os.chmod(tmp_script_path, 0o755)
+        except Exception as e:
+            try:
+                os.unlink(tmp_conf_path)
+            except Exception:
+                pass
+            return f"Не вдалося створити скрипт налаштування: {e}", None
+
+        status_cb(f"[3/3] Налаштування WireGuard (потрібні права адміністратора)...")
+        try:
+            result = subprocess.run(
+                ["pkexec", "bash", tmp_script_path],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr.strip() or result.stdout.strip() or f"код {result.returncode}")
+                return f"Не вдалося налаштувати WireGuard: {detail}", None
+        except subprocess.TimeoutExpired:
+            return "Час очікування налаштування WireGuard вичерпано (60 с)", None
+        except FileNotFoundError:
+            return "pkexec не знайдено. Встановіть: sudo apt install policykit-1", None
+        except Exception as e:
+            return f"Помилка запуску WireGuard: {e}", None
+        finally:
+            for path in (tmp_script_path, tmp_conf_path):
+                if path:
+                    try:
+                        os.unlink(path)
+                    except Exception:
+                        pass
+
+        return None, camera_ip
+
+    def _apply_vpn_camera_ip(self, camera_ip: str):
+        """Оновлює bridge і FC telemetry на IP камери з VPN-тунелю."""
+        self.bridge_remote_host = camera_ip
+        self.fc_telemetry_host = camera_ip
+        self.save_settings()
+        self.restart_bridge()
+        self.fc_reconnect_requested = True
+        print(f"[VPN] IP камери оновлено: {camera_ip}", flush=True)
 
     def on_destroy(self, widget):
         self.running = False

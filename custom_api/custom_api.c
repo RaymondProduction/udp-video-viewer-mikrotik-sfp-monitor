@@ -1023,6 +1023,7 @@ static int vpn_reconfigure_for_crew(int crew_id, char *out_msg, size_t out_sz)
 
     /* ── 4. Витягти поля відповіді ───────────────────────────── */
     char camera_ip[64]    = {0};
+    char ground_ip[64]    = {0};
     char network[64]      = {0};
     char config_raw[4096] = {0};
 
@@ -1030,6 +1031,12 @@ static int vpn_reconfigure_for_crew(int crew_id, char *out_msg, size_t out_sz)
         free(http_buf);
         snprintf(out_msg, out_sz,
             "{\"ok\":false,\"error\":\"no camera_ip in provision response\"}");
+        return -1;
+    }
+    if (!json_get_string_field(json_body, "ground_ip", ground_ip, sizeof(ground_ip))) {
+        free(http_buf);
+        snprintf(out_msg, out_sz,
+            "{\"ok\":false,\"error\":\"no ground_ip in provision response\"}");
         return -1;
     }
     if (!json_get_string_field(json_body, "config", config_raw, sizeof(config_raw))) {
@@ -1052,6 +1059,13 @@ static int vpn_reconfigure_for_crew(int crew_id, char *out_msg, size_t out_sz)
         if (!isdigit((unsigned char)*p) && *p != '.') {
             snprintf(out_msg, out_sz,
                 "{\"ok\":false,\"error\":\"invalid camera_ip format: %s\"}", camera_ip);
+            return -1;
+        }
+    }
+    for (const char *p = ground_ip; *p; p++) {
+        if (!isdigit((unsigned char)*p) && *p != '.') {
+            snprintf(out_msg, out_sz,
+                "{\"ok\":false,\"error\":\"invalid ground_ip format: %s\"}", ground_ip);
             return -1;
         }
     }
@@ -1122,13 +1136,21 @@ static int vpn_reconfigure_for_crew(int crew_id, char *out_msg, size_t out_sz)
     vpn_run_cmd("wg show " WG_IFACE);
     vpn_run_cmd("ip addr show " WG_IFACE);
 
-    LOG("vpn: crew_id=%d camera_ip=%s/%s — " WG_IFACE " is up",
-        crew_id, camera_ip, prefix);
+    /* ── 15. Оновити outgoing.server у waybeam ───────────────── */
+    char waybeam_cmd[256];
+    snprintf(waybeam_cmd, sizeof(waybeam_cmd),
+        "wget -q -O /dev/null "
+        "'http://127.0.0.1:4380/api/v1/set?outgoing.server=udp://%s:5600'",
+        ground_ip);
+    vpn_run_cmd(waybeam_cmd);
+
+    LOG("vpn: crew_id=%d camera=%s ground=%s — " WG_IFACE " is up",
+        crew_id, camera_ip, ground_ip);
 
     snprintf(out_msg, out_sz,
         "{\"ok\":true,\"crew_id\":%d,\"camera_ip\":\"%s\","
-        "\"iface\":\"" WG_IFACE "\"}",
-        crew_id, camera_ip);
+        "\"ground_ip\":\"%s\",\"iface\":\"" WG_IFACE "\"}",
+        crew_id, camera_ip, ground_ip);
     return 0;
 }
 
